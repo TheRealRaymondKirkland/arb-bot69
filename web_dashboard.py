@@ -30,6 +30,8 @@ load_dotenv()
 
 from kalshi.kalshi_client import KalshiClient, _get
 from cross_platform.binary_scanner import scan_binary_arb
+from sports.sports_scanner import scan_sports_arb
+from weather.weather_scanner import scan_weather_opportunities
 from utils.trade_log import daily_pnl
 from utils.paper_trader import get_paper_summary, record_paper_trade, get_open_positions, settle_position
 from utils.notifier import notify_open, notify_close, notify_pnl
@@ -37,33 +39,41 @@ from utils.daily_logger import log_open, log_close, generate_summary
 
 logging.basicConfig(level=logging.INFO)
 
-SCAN_INTERVAL      = int(os.getenv("SCAN_INTERVAL", "60"))
-DRY_RUN            = os.getenv("DRY_RUN", "true").lower() != "false"
-MIN_PROFIT         = float(os.getenv("MIN_PROFIT", "0.03"))
-MAX_PROFIT         = float(os.getenv("MAX_PROFIT", "0.15"))
-MAX_DAILY_LOSS     = float(os.getenv("MAX_DAILY_LOSS", "20"))
-PORT               = int(os.getenv("DASHBOARD_PORT", "8080"))
-MAX_POSITION_USDC  = float(os.getenv("MAX_POSITION_USDC", "50"))
-SIM_SETTLE_HOURS   = float(os.getenv("SIM_SETTLE_HOURS", "24"))
+SCAN_INTERVAL         = int(os.getenv("SCAN_INTERVAL", "120"))
+WEATHER_SCAN_INTERVAL = int(os.getenv("WEATHER_SCAN_INTERVAL", "30"))
+DRY_RUN               = os.getenv("DRY_RUN", "true").lower() != "false"
+MIN_PROFIT            = float(os.getenv("MIN_PROFIT", "0.03"))
+MAX_PROFIT            = float(os.getenv("MAX_PROFIT", "0.15"))
+MAX_DAILY_LOSS        = float(os.getenv("MAX_DAILY_LOSS", "20"))
+PORT                  = int(os.getenv("DASHBOARD_PORT", "8080"))
+MAX_POSITION_USDC     = float(os.getenv("MAX_POSITION_USDC", "50"))
+SIM_SETTLE_HOURS      = float(os.getenv("SIM_SETTLE_HOURS", "0"))
 SETTLE_CHECK_INTERVAL = 900   # Poll Kalshi API for real resolution every 15 min
 
 # ─── Shared state ─────────────────────────────────────────────────────────────
 
 state = {
-    "mode":           "DRY RUN" if DRY_RUN else "LIVE",
-    "balance":        None,
-    "scan_count":     0,
-    "start_time":     time.time(),
-    "last_scan_ts":   None,
-    "last_scan_dur":  None,
-    "scanning":       False,
-    "kalshi_opps":    [],
-    "binary":         None,
-    "log":            deque(maxlen=80),
-    "arb_alerts":     deque(maxlen=20),
-    "next_scan_in":   SCAN_INTERVAL,
-    "paper":          None,
-    "_current_day":   datetime.now().strftime("%Y-%m-%d"),
+    "mode":              "DRY RUN" if DRY_RUN else "LIVE",
+    "balance":           None,
+    "scan_count":        0,
+    "wx_scan_count":     0,
+    "start_time":        time.time(),
+    "last_scan_ts":      None,
+    "last_scan_dur":     None,
+    "last_wx_scan_ts":   None,
+    "last_wx_scan_dur":  None,
+    "scanning":          False,
+    "wx_scanning":       False,
+    "kalshi_opps":       [],
+    "binary":            None,
+    "sports":            None,
+    "weather":           None,
+    "log":               deque(maxlen=80),
+    "arb_alerts":        deque(maxlen=20),
+    "next_scan_in":      SCAN_INTERVAL,
+    "next_wx_in":        WEATHER_SCAN_INTERVAL,
+    "paper":             None,
+    "_current_day":      datetime.now().strftime("%Y-%m-%d"),
 }
 
 clients: set[WebSocket] = set()
@@ -93,67 +103,119 @@ async def broadcast(event: str, data: dict):
 
 async def settle_open_positions(client: httpx.AsyncClient):
     """
-    Two-pass settlement:
-      1. Real: ask Kalshi API if market resolved (result='yes') — throttled to once/hour.
-      2. Simulated: auto-close positions older than SIM_SETTLE_HOURS at expected payout.
-    MECE arb payout = sets × $1 (exactly one leg always wins $1/contract).
+    Settle open paper positions by querying Kalshi API.
+    MECE arb: any leg with result='yes' → win (exactly one always wins).
+    WeatherEdge: check our specific ticker — win/loss based on action vs result.
     """
-    positions = [p for p in get_open_positions() if p["platform"] == "Kalshi"]
+    positions = get_open_positions()
     if not positions:
         return
 
     do_api_check = (time.time() - state.get("last_settle_check", 0)) >= SETTLE_CHECK_INTERVAL
     if do_api_check:
         state["last_settle_check"] = time.time()
+    if not do_api_check:
+        return
 
     sem = asyncio.Semaphore(5)
 
-    async def check_one(pos):
+    async def settle_mece(pos):
+        """MECE arb: fetch all legs of the event, find winner."""
         async with sem:
-            event  = pos["event"]
-            sets   = float(pos["sets"] or 1.0)
-            cost   = float(pos["cost"])
-
-            # Pass 1 — real resolution via Kalshi API (throttled to once/15 min)
-            if do_api_check:
-                try:
-                    data    = await _get(client, "/markets", {"event_ticker": event, "limit": 50})
-                    markets = data.get("markets", [])
-                    winner  = next((m for m in markets if m.get("result") == "yes"), None)
-                    if winner:
-                        payout = round(sets * 1.0, 4)
-                        if settle_position(event, payout):
-                            log(f"  [PAPER] settled (resolved): {event}  pnl=${payout - cost:+.4f}", "success")
-                            notify_close(event, pos["platform"], cost, payout)
-                            log_close(pos["platform"], event, sets, cost, payout)
-                        return
-                    # Void check: all legs finalized but no winner → Kalshi voided, refund at cost
-                    if markets and all(m.get("status") in ("finalized", "settled") for m in markets):
-                        if settle_position(event, cost):
-                            log(f"  [PAPER] voided: {event} — refunded ${cost:.4f} (no winner)", "warn")
-                            notify_close(event, pos["platform"], cost, cost)
-                            log_close(pos["platform"], event, sets, cost, cost)
-                        return
-                except Exception:
-                    pass
-
-            # Stuck-position warning: open far longer than expected close window
-            age_days = (datetime.now() - datetime.fromisoformat(pos["ts"])).total_seconds() / 86400
-            max_days = float(os.getenv("MAX_DAYS_TO_CLOSE", "7"))
-            if age_days > max_days + 3:
-                log(f"  [PAPER] WARNING: {event} open {age_days:.1f}d — may be stuck (no resolution yet)", "warn")
-
-            # Pass 2 — simulated settlement after SIM_SETTLE_HOURS
-            if SIM_SETTLE_HOURS > 0:
-                age_h = (datetime.now() - datetime.fromisoformat(pos["ts"])).total_seconds() / 3600
-                if age_h >= SIM_SETTLE_HOURS:
-                    payout = round(cost + float(pos["expected_profit"]), 4)
+            event = pos["event"]
+            sets  = float(pos["sets"] or 1.0)
+            cost  = float(pos["cost"])
+            try:
+                data    = await _get(client, "/markets", {"event_ticker": event, "limit": 50})
+                markets = data.get("markets", [])
+                winner  = next((m for m in markets if m.get("result") == "yes"), None)
+                if winner:
+                    payout = round(sets * 1.0, 4)
                     if settle_position(event, payout):
-                        log(f"  [PAPER] settled (sim {age_h:.1f}h): {event}  pnl=+${pos['expected_profit']:.4f}", "success")
+                        log(f"  [PAPER] settled: {event}  pnl=${payout-cost:+.4f}", "success")
                         notify_close(event, pos["platform"], cost, payout)
                         log_close(pos["platform"], event, sets, cost, payout)
+                    return
+                if markets and all(m.get("status") in ("finalized", "settled") for m in markets):
+                    if settle_position(event, cost):
+                        log(f"  [PAPER] voided: {event} — refund ${cost:.4f}", "warn")
+                        notify_close(event, pos["platform"], cost, cost)
+                        log_close(pos["platform"], event, sets, cost, cost)
+            except Exception:
+                pass
+            # Stuck warning
+            age_days = (datetime.now() - datetime.fromisoformat(pos["ts"])).total_seconds() / 86400
+            if age_days > float(os.getenv("MAX_DAYS_TO_CLOSE", "30")) + 3:
+                log(f"  [PAPER] WARNING: {event} open {age_days:.1f}d — possibly stuck", "warn")
 
-    await asyncio.gather(*[check_one(p) for p in positions])
+    async def settle_weather(pos):
+        """WeatherEdge: resolve by checking our specific market ticker."""
+        async with sem:
+            market_ticker  = pos["event"]      # stored as market ticker for WeatherEdge
+            sets  = float(pos["sets"] or 1.0)
+            cost  = float(pos["cost"])
+            try:
+                orders = json.loads(pos.get("orders") or "[]")
+            except Exception:
+                orders = []
+            action       = orders[0].get("action", "buy_yes") if orders else "buy_yes"
+            event_ticker = orders[0].get("event_ticker", "") if orders else ""
+
+            if not event_ticker:
+                return
+
+            try:
+                data    = await _get(client, "/markets", {
+                    "event_ticker": event_ticker, "limit": 20
+                })
+                markets = data.get("markets", [])
+                # Find the winning bucket
+                winner = next((m for m in markets if m.get("result") == "yes"), None)
+                all_done = markets and all(
+                    m.get("status") in ("finalized", "settled") for m in markets
+                )
+
+                if winner is None and not all_done:
+                    return   # still live
+
+                if winner is None and all_done:
+                    # Voided event
+                    if settle_position(market_ticker, cost):
+                        log(f"  [PAPER] weather VOIDED: {market_ticker} — refund ${cost:.4f}", "warn")
+                    return
+
+                # Market resolved — check if we're on the right side
+                winner_ticker = winner.get("ticker", "") if winner else ""
+                we_won = (
+                    (action == "buy_yes" and winner_ticker == market_ticker) or
+                    (action == "buy_no"  and winner_ticker != market_ticker)
+                )
+                payout = round(sets * 1.0, 4) if we_won else 0.0
+                if settle_position(market_ticker, payout):
+                    pnl = payout - cost
+                    if we_won:
+                        log(f"  [PAPER] weather WIN ({action}): {market_ticker}  pnl=${pnl:+.4f}", "success")
+                    else:
+                        log(f"  [PAPER] weather LOSS ({action}): {market_ticker}  pnl=${pnl:+.4f}", "warn")
+                    notify_close(market_ticker, "WeatherEdge", cost, payout)
+                    log_close("WeatherEdge", market_ticker, sets, cost, payout)
+            except Exception as e:
+                logger.debug(f"WeatherEdge settle failed for {market_ticker}: {e}")
+
+        # Stuck warning
+        age_days = (datetime.now() - datetime.fromisoformat(pos["ts"])).total_seconds() / 86400
+        if age_days > 5:
+            log(f"  [PAPER] WARNING: weather {market_ticker} open {age_days:.1f}d — may be stuck", "warn")
+
+    tasks = []
+    for pos in positions:
+        if pos["platform"] == "WeatherEdge":
+            tasks.append(settle_weather(pos))
+        elif pos["platform"] == "Kalshi":
+            tasks.append(settle_mece(pos))
+
+    if tasks:
+        await asyncio.gather(*tasks)
 
 
 async def run_scan():
@@ -338,6 +400,59 @@ async def run_scan():
         except Exception as e:
             log(f"binary scan error: {e}", "error")
 
+        # Sports arb scan
+        log("scanning sports arb (Kalshi × Polymarket)...", "dim")
+        try:
+            sports = await scan_sports_arb(client, min_profit=MIN_PROFIT)
+            pairs = [
+                {
+                    "team":          p.team,
+                    "sport":         p.sport,
+                    "k_yes":         p.kalshi_yes_ask,
+                    "k_bid":         p.kalshi_yes_bid,
+                    "p_yes":         p.poly_yes_ask,
+                    "p_bid":         p.poly_yes_bid,
+                    "gap":           round(p.gap, 4),
+                    "direction":     p.direction,
+                    "k_ticker":      p.kalshi_ticker,
+                    "poly_question": p.poly_question,
+                }
+                for p in sports["pairs"]
+            ]
+            arbs = [
+                {
+                    "team":      a.team,
+                    "sport":     a.sport,
+                    "direction": a.direction,
+                    "profit":    a.profit_pct,
+                    "gross":     a.gross_profit,
+                    "k_yes":     a.kalshi_yes_ask,
+                    "p_yes":     a.poly_yes_ask,
+                    "k_ticker":  a.kalshi_ticker,
+                }
+                for a in sports["opportunities"]
+            ]
+            state["sports"] = {
+                "kalshi_count": sports["kalshi_count"],
+                "poly_count":   sports["poly_count"],
+                "pair_count":   len(pairs),
+                "pairs":        pairs,
+                "arbs":         arbs,
+            }
+            log(f"sports scan: {len(pairs)} matched pairs · {len(arbs)} arbs", "info" if arbs else "dim")
+            for a in arbs:
+                msg = f"*** SPORTS ARB: {a['profit']*100:.2f}% — {a['team']} ({a['sport']}) [{a['direction']}]"
+                log(msg, "arb")
+                state["arb_alerts"].appendleft({
+                    "ts": ts(), "profit": a["profit"], "k_title": a["team"],
+                    "p_title": a["sport"], "direction": a["direction"]
+                })
+                notify_open(a["team"], f"SportsArb/{a['sport']}", 1, 1 - a["profit"], a["profit"])
+        except Exception as e:
+            log(f"sports scan error: {e}", "error")
+
+        # Weather scan runs in its own fast loop (see weather_scan_loop below)
+
     dur = round(time.time() - t0, 1)
     state["scanning"]      = False
     state["scan_count"]   += 1
@@ -391,6 +506,8 @@ def build_state_payload(pnl=None, trades=None) -> dict:
         "trades":        trades,
         "kalshi_opps":   state["kalshi_opps"],
         "binary":        state["binary"],
+        "sports":        state["sports"],
+        "weather":       state["weather"],
         "log":           list(state["log"])[-40:],
         "arb_alerts":    list(state["arb_alerts"]),
         "next_scan_in":  state["next_scan_in"],
@@ -433,11 +550,148 @@ def _uptime_str() -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+async def run_weather_scan():
+    """Fast standalone weather scan — runs every WEATHER_SCAN_INTERVAL seconds."""
+    state["wx_scanning"] = True
+    t0 = time.time()
+
+    paper   = state.get("paper") or get_paper_summary()
+    balance = float(paper.get("virtual_balance") or 1000.0)
+
+    async with httpx.AsyncClient() as client:
+        # Also run settlement on WeatherEdge positions
+        wx_positions = [p for p in get_open_positions() if p["platform"] == "WeatherEdge"]
+        if wx_positions:
+            await settle_open_positions(client)
+
+        try:
+            wx   = await scan_weather_opportunities(
+                client,
+                min_edge=0.10,
+                max_days=3.0,
+                portfolio_balance=balance,
+            )
+            opps = wx["opportunities"]
+            state["weather"] = {
+                "event_count":   wx["event_count"],
+                "pair_count":    len(wx["all_pairs"]),
+                "opp_count":     len(opps),
+                "tomorrow_on":   wx.get("tomorrow_on", False),
+                "opportunities": [
+                    {
+                        "event":      o.event_ticker,
+                        "city":       o.city.title(),
+                        "metric":     o.metric,
+                        "date":       o.target_date,
+                        "leg":        o.leg_title,
+                        "kalshi_ask": o.kalshi_ask,
+                        "noaa_prob":  o.prob,
+                        "noaa_temp":  o.forecast,
+                        "edge":       o.edge,
+                        "net_profit": o.net_profit,
+                        "action":     o.action,
+                        "days_left":  o.days_to_close,
+                        "contracts":  o.contracts,
+                        "deploy_usd": o.deploy_usd,
+                    }
+                    for o in opps
+                ],
+                "all_pairs": wx["all_pairs"],
+            }
+
+            src = "NOAA+Tomorrow.io" if wx.get("tomorrow_on") else "NOAA"
+            log(
+                f"wx [{src}]: {wx['event_count']} events · "
+                f"{len(wx['all_pairs'])} legs · {len(opps)} edges",
+                "info" if opps else "dim",
+            )
+
+            for o in opps:
+                direction = "BUY YES" if o.action == "buy_yes" else "BUY NO"
+                msg = (
+                    f"*** WEATHER EDGE: {o.edge*100:+.1f}% — "
+                    f"{o.city.title()} {o.metric} {o.leg_title}  "
+                    f"forecast={o.forecast}°F  {o.contracts}x [{direction}]  "
+                    f"deploy=${o.deploy_usd:.2f}"
+                )
+                log(msg, "arb")
+                state["arb_alerts"].appendleft({
+                    "ts":        ts(),
+                    "profit":    abs(o.net_profit * o.contracts),
+                    "k_title":   f"{o.city.title()} {o.metric} {o.leg_title}",
+                    "p_title":   f"forecast={o.forecast}°F  Kelly={o.contracts}x",
+                    "direction": direction,
+                })
+
+                if DRY_RUN and not state.get("circuit_open"):
+                    cost   = o.deploy_usd
+                    profit = round(o.net_profit * o.contracts, 6)
+                    pt = record_paper_trade(
+                        platform="WeatherEdge",
+                        event=o.ticker,
+                        sets=o.contracts,
+                        cost=round(cost, 6),
+                        expected_profit=profit,
+                        orders=[{
+                            "ticker":       o.ticker,
+                            "event_ticker": o.event_ticker,
+                            "action":       o.action,
+                            "at_price":     o.kalshi_ask,
+                            "contracts":    o.contracts,
+                        }],
+                    )
+                    if pt["status"] == "opened":
+                        log(
+                            f"  [PAPER] wx trade: {o.ticker}  {direction}  "
+                            f"{o.contracts}x  cost=${cost:.2f}  ep=+${profit:.4f}",
+                            "success",
+                        )
+                        notify_open(o.ticker, "WeatherEdge", o.contracts, cost, profit)
+                        log_open("WeatherEdge", o.ticker, o.contracts, cost, profit)
+
+        except Exception as e:
+            log(f"weather scan error: {e}", "error")
+
+    dur = round(time.time() - t0, 1)
+    state["wx_scanning"]      = False
+    state["wx_scan_count"]   += 1
+    state["last_wx_scan_ts"]  = ts()
+    state["last_wx_scan_dur"] = dur
+
+    # Update paper state and broadcast weather update
+    state["paper"] = get_paper_summary()
+    pnl, trades = daily_pnl()
+    await broadcast("state_update", build_state_payload(pnl, trades))
+
+
+async def weather_scan_loop():
+    """Dedicated fast weather scan loop — independent of main scan cadence."""
+    from weather.noaa_client import prefetch_all
+    await asyncio.sleep(3)   # let the main loop start first
+    # Warm NOAA cache for all cities before first scan
+    try:
+        await prefetch_all()
+        log("NOAA forecasts pre-cached for all cities", "system")
+    except Exception as e:
+        log(f"NOAA prefetch warning: {e}", "warn")
+
+    while True:
+        try:
+            await run_weather_scan()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("Weather scan loop crashed")
+            log(f"wx crash: {e} — resuming in {WEATHER_SCAN_INTERVAL}s", "error")
+        await asyncio.sleep(WEATHER_SCAN_INTERVAL)
+
+
 from contextlib import asynccontextmanager
 
 @asynccontextmanager
 async def lifespan(app):
     asyncio.create_task(scan_loop())
+    asyncio.create_task(weather_scan_loop())
     yield
 
 app = FastAPI(lifespan=lifespan)

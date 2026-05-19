@@ -388,6 +388,31 @@
     </div>
   </div>
 
+  <!-- Sports Arb: Kalshi × Polymarket -->
+  <div class="panel" style="grid-column: 1 / -1;">
+    <div class="panel-header">
+      <span class="panel-title">🏆 Sports Arb  //  Kalshi × Polymarket</span>
+      <span class="badge cyan" id="sports-pair-count">— pairs</span>
+      <span class="badge dim" id="sports-arb-count" style="margin-left:auto">0 ARBs</span>
+    </div>
+    <div class="panel-body" id="sports-body">
+      <div class="empty">waiting for scan...</div>
+    </div>
+  </div>
+
+  <!-- Weather Edge: NOAA + Tomorrow.io vs Kalshi -->
+  <div class="panel" style="grid-column: 1 / -1;">
+    <div class="panel-header">
+      <span class="panel-title">🌤 Weather Edge  //  Ensemble Forecast vs Kalshi</span>
+      <span class="badge cyan"   id="wx-pair-count">— legs</span>
+      <span class="badge dim"    id="wx-src-badge"  style="margin-left:8px">NOAA only</span>
+      <span class="badge dim"    id="wx-opp-count"  style="margin-left:auto">0 edges</span>
+    </div>
+    <div class="panel-body" id="wx-body">
+      <div class="empty">waiting for first weather scan...</div>
+    </div>
+  </div>
+
   <!-- Paper Portfolio spans full width -->
   <div class="panel" style="grid-column: 1 / -1; max-height: 220px;">
     <div class="panel-header">
@@ -523,6 +548,12 @@
     // Binary panel
     if (d.binary) renderBinary(d.binary);
 
+    // Sports panel
+    if (d.sports) renderSports(d.sports);
+
+    // Weather panel
+    if (d.weather) renderWeather(d.weather);
+
     // Log
     renderLog(d.log || []);
 
@@ -652,6 +683,142 @@
         <td class="text-dim">$${p.p_yes.toFixed(3)}</td>
         <td>${gapStr}</td>
         <td><span class="dir-badge ${dirActive?'active':''}">${p.dir.replace('_YES+','✓+').replace('_NO','←')}</span></td>
+      </tr>`;
+    }
+
+    html += '</tbody></table>';
+    body.innerHTML = html;
+  }
+
+  /* ── Weather Edge table ── */
+  function renderWeather(w) {
+    document.getElementById('wx-pair-count').textContent =
+      `${w.event_count} events · ${w.pair_count} legs`;
+    const oppBadge = document.getElementById('wx-opp-count');
+    if (w.opp_count > 0) {
+      oppBadge.textContent = `${w.opp_count} EDGE${w.opp_count>1?'S':''} 🔥`;
+      oppBadge.className = 'badge green';
+    } else {
+      oppBadge.textContent = '0 edges';
+      oppBadge.className = 'badge dim';
+    }
+    const srcBadge = document.getElementById('wx-src-badge');
+    if (srcBadge) {
+      srcBadge.textContent  = w.tomorrow_on ? 'NOAA + Tomorrow.io' : 'NOAA only';
+      srcBadge.className    = w.tomorrow_on ? 'badge cyan' : 'badge dim';
+    }
+
+    const body = document.getElementById('wx-body');
+    const pairs = w.all_pairs || [];
+    if (!pairs.length) {
+      body.innerHTML = '<div class="empty">no weather markets within 2 days — check back later</div>';
+      return;
+    }
+
+    let html = `<table>
+      <thead><tr>
+        <th>City</th>
+        <th>Metric</th>
+        <th>Date</th>
+        <th>Leg</th>
+        <th>Forecast</th>
+        <th>Our Prob</th>
+        <th>Kalshi Ask</th>
+        <th>Edge</th>
+        <th>Kelly</th>
+        <th>Deploy</th>
+        <th>Action</th>
+      </tr></thead><tbody>`;
+
+    for (const p of pairs) {
+      const edge    = p.edge;
+      const isHot   = Math.abs(edge) >= 0.12 && p.net_profit > 0;
+      const edgeCls = edge >= 0.12 ? 'profit-pos' : edge <= -0.12 ? 'profit-neg' : 'text-dim';
+      const edgeStr = `<span class="${edgeCls}">${edge >= 0 ? '+' : ''}${(edge*100).toFixed(1)}%</span>`;
+      const action  = p.action === 'buy_yes'
+        ? '<span class="dir-badge active">BUY YES</span>'
+        : '<span class="dir-badge" style="color:var(--orange)">BUY NO</span>';
+      const rowCls  = isHot ? 'class="arb-row"' : '';
+      const kellyStr = p.contracts > 1
+        ? `<span class="text-cyan">${p.contracts}x</span>`
+        : `<span class="text-dim">1x</span>`;
+      const deployStr = p.deploy_usd > 0
+        ? `<span class="${isHot ? 'text-orange' : 'text-dim'}">$${p.deploy_usd.toFixed(2)}</span>`
+        : '<span class="text-dim">—</span>';
+      html += `<tr ${rowCls}>
+        <td class="${isHot ? 'text-green' : 'text-dim'}">${esc(p.city)}</td>
+        <td class="text-dim">${p.metric.toUpperCase()}</td>
+        <td class="text-dim">${p.target_date}</td>
+        <td class="${isHot ? 'text-green' : 'text-dim'}">${esc(p.leg_title)}</td>
+        <td class="text-cyan">${p.noaa_forecast}°F</td>
+        <td class="${isHot ? 'profit-pos' : 'text-dim'}">${(p.noaa_prob*100).toFixed(1)}%</td>
+        <td class="text-orange">${(p.kalshi_ask*100).toFixed(1)}%</td>
+        <td>${edgeStr}</td>
+        <td>${kellyStr}</td>
+        <td>${deployStr}</td>
+        <td>${isHot ? action : '<span class="text-dim">—</span>'}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    body.innerHTML = html;
+  }
+
+  /* ── Sports Arb table ── */
+  function renderSports(s) {
+    const pairBadge = document.getElementById('sports-pair-count');
+    const arbBadge  = document.getElementById('sports-arb-count');
+    pairBadge.textContent = `${s.kalshi_count} kalshi · ${s.poly_count} poly · ${s.pair_count} pairs`;
+
+    if (s.arbs && s.arbs.length > 0) {
+      arbBadge.textContent = `${s.arbs.length} ARB${s.arbs.length>1?'S':''} LIVE 🔥`;
+      arbBadge.className = 'badge green';
+    } else {
+      arbBadge.textContent = '0 ARBs';
+      arbBadge.className = 'badge dim';
+    }
+
+    const body = document.getElementById('sports-body');
+    if (!s.pairs || !s.pairs.length) {
+      body.innerHTML = '<div class="empty">no matched sports markets yet — scanning...</div>';
+      return;
+    }
+
+    let html = `<table>
+      <thead><tr>
+        <th>Team</th>
+        <th>Sport</th>
+        <th>Kalshi YES</th>
+        <th>Poly YES</th>
+        <th>Spread</th>
+        <th>Direction</th>
+      </tr></thead><tbody>`;
+
+    for (const a of (s.arbs || [])) {
+      const dir = a.direction === 'buy_poly_yes' ? 'Buy Poly YES + Kalshi NO' : 'Buy Kalshi YES + Poly NO';
+      html += `<tr class="arb-row">
+        <td class="text-green">${esc(a.team)}</td>
+        <td class="text-cyan">${esc(a.sport)}</td>
+        <td class="text-cyan">$${a.k_yes.toFixed(3)}</td>
+        <td class="text-cyan">$${a.p_yes.toFixed(3)}</td>
+        <td class="profit-pos">+${(a.profit*100).toFixed(2)}% 🔥</td>
+        <td><span class="dir-badge active">${dir}</span></td>
+      </tr>`;
+    }
+
+    for (const p of s.pairs) {
+      const gap    = p.gap;
+      const gapCls = gap >= 0.02 ? 'profit-pos' : gap >= 0 ? 'profit-near' : 'text-dim';
+      const gapStr = `<span class="${gapCls}">${gap >= 0 ? '+' : ''}${(gap*100).toFixed(2)}%</span>`;
+      const dir    = p.direction === 'buy_poly_yes' ? 'Poly YES' : 'Kalshi YES';
+      const kDiff  = p.k_yes - p.p_yes;
+      const diffCls = Math.abs(kDiff) < 0.01 ? 'text-dim' : kDiff > 0 ? 'profit-neg' : 'profit-pos';
+      html += `<tr>
+        <td class="text-green">${esc(p.team)}</td>
+        <td class="text-dim">${esc(p.sport)}</td>
+        <td class="${kDiff > 0 ? 'text-orange' : 'text-dim'}">$${p.k_yes.toFixed(3)}</td>
+        <td class="${kDiff < 0 ? 'text-orange' : 'text-dim'}">$${p.p_yes.toFixed(3)}</td>
+        <td>${gapStr}</td>
+        <td class="text-dim">${dir}</td>
       </tr>`;
     }
 
