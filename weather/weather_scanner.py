@@ -27,7 +27,7 @@ from weather.noaa_client import (
     get_daily_low  as noaa_daily_low,
     CITIES,
 )
-import weather.tomorrow_client as tomorrow
+import weather.openmeteo_client as openmeteo
 
 logger = logging.getLogger(__name__)
 
@@ -131,27 +131,39 @@ def kelly_contracts(p: float, ask: float, balance: float,
     return max(1, int(deploy / ask))
 
 
-# ── Ensemble forecast ─────────────────────────────────────────────────────────
+# ── Ensemble forecast (display only) ─────────────────────────────────────────
 
-async def _ensemble(city: str, metric: str, d: date) -> Optional[float]:
+async def _point_forecast(city: str, metric: str, d: date) -> Optional[float]:
     """
-    Blend NOAA (free, always) + Tomorrow.io (ML, optional) forecasts.
-    Weights: NOAA 40%, Tomorrow.io 60% when both available.
+    Get a single point forecast for display. Tries Open-Meteo mean, then NOAA.
+    NOT used for probability — that comes from get_ensemble_prob() below.
     """
     noaa_coro = noaa_daily_high(city, d) if metric == "high" else noaa_daily_low(city, d)
-    if tomorrow.is_available():
-        tmrw_coro = (tomorrow.get_daily_high(city, d)
-                     if metric == "high" else tomorrow.get_daily_low(city, d))
-        noaa_f, tmrw_f = await asyncio.gather(noaa_coro, tmrw_coro)
-    else:
-        noaa_f = await noaa_coro
-        tmrw_f = None
+    om_coro   = openmeteo.get_daily_high(city, d) if metric == "high" else openmeteo.get_daily_low(city, d)
+    noaa_f, om_f = await asyncio.gather(noaa_coro, om_coro)
 
-    if noaa_f is None:
-        return tmrw_f
-    if tmrw_f is None:
-        return noaa_f
-    return round(0.4 * noaa_f + 0.6 * tmrw_f, 1)
+    if om_f is not None and noaa_f is not None:
+        return round(0.4 * noaa_f + 0.6 * om_f, 1)
+    return om_f or noaa_f
+
+
+async def get_ensemble_prob(
+    city: str, d: date, metric: str,
+    low_f: Optional[float], high_f: Optional[float],
+) -> tuple[float, str]:
+    """
+    Compute P(metric in [low_f, high_f]) using Open-Meteo ensemble (40 members).
+    Falls back to NOAA + Gaussian if ensemble unavailable.
+    Returns (probability, source_label).
+    """
+    om_prob = await openmeteo.get_bucket_prob(city, d, metric, low_f, high_f)
+    if om_prob is not None:
+        return om_prob, "ensemble"
+    # Fallback: NOAA point + Gaussian sigma=3°F
+    noaa_f = await (noaa_daily_high(city, d) if metric == "high" else noaa_daily_low(city, d))
+    if noaa_f is not None:
+        return _prob(noaa_f, low_f, high_f), "noaa+gaussian"
+    return 0.5, "unknown"
 
 
 # ── Range parser ──────────────────────────────────────────────────────────────
@@ -268,7 +280,6 @@ async def scan_weather_opportunities(
     from kalshi.kalshi_client import _get
 
     series_map = await _discover_series(client)
-    tmrw_on    = tomorrow.is_available()
 
     # ── Step 1: fetch all active events in parallel ───────────────────────────
     weather_events: list[tuple[str, str, str]] = []
@@ -293,7 +304,14 @@ async def scan_weather_opportunities(
 
     now_utc = datetime.now(timezone.utc)
 
-    # ── Step 2: parallel ensemble forecasts for unique (city, metric, date) ───
+    # ── Step 2: pre-warm Open-Meteo ensemble cache for all relevant cities ────
+    active_cities = {city for _, city, _ in weather_events}
+    await asyncio.gather(
+        *[openmeteo._fetch_ensemble(c) for c in active_cities],
+        return_exceptions=True,
+    )
+
+    # Point forecast cache for display only
     combos: set[tuple[str, str, date]] = set()
     for et, city, metric in weather_events:
         d = _parse_event_date(et)
@@ -303,15 +321,15 @@ async def scan_weather_opportunities(
         if 0 <= days_out <= max_days:
             combos.add((city, metric, d))
 
-    forecast_cache: dict[tuple, Optional[float]] = {}
+    point_cache: dict[tuple, Optional[float]] = {}
 
-    async def do_forecast(city: str, metric: str, d: date):
+    async def do_point(city: str, metric: str, d: date):
         try:
-            forecast_cache[(city, metric, d)] = await _ensemble(city, metric, d)
+            point_cache[(city, metric, d)] = await _point_forecast(city, metric, d)
         except Exception as e:
-            logger.warning(f"Ensemble failed {city}/{metric}/{d}: {e}")
+            logger.warning(f"Point forecast failed {city}/{metric}/{d}: {e}")
 
-    await asyncio.gather(*[do_forecast(c, m, d) for c, m, d in combos])
+    await asyncio.gather(*[do_point(c, m, d) for c, m, d in combos])
 
     # ── Step 3: fetch market legs + compute edges in parallel ─────────────────
     opportunities: list[WeatherOpportunity] = []
@@ -325,9 +343,7 @@ async def scan_weather_opportunities(
         if days_out < 0 or days_out > max_days:
             return
 
-        forecast = forecast_cache.get((city, metric, d))
-        if forecast is None:
-            return
+        forecast = point_cache.get((city, metric, d))   # for display only
 
         async with _SEM:
             try:
@@ -350,16 +366,27 @@ async def scan_weather_opportunities(
 
         logger.debug(
             f"{event_ticker} | {city} {metric} {d} | "
-            f"ensemble={forecast}°F | {len(markets)} legs | {days_left:.1f}d"
+            f"point={forecast}°F | {len(markets)} legs | {days_left:.1f}d"
         )
 
+        # Compute ensemble probs for all legs in this event in parallel
+        leg_data = []
         for m in markets:
-            leg   = m.get("yes_sub_title", "")
+            leg    = m.get("yes_sub_title", "")
             lo, hi = _parse_range(leg)
             if lo is None and hi is None:
                 continue
+            leg_data.append((m, leg, lo, hi))
 
-            p     = _prob(forecast, lo, hi)
+        if not leg_data:
+            return
+
+        prob_results = await asyncio.gather(*[
+            get_ensemble_prob(city, d, metric, lo, hi)
+            for _, _, lo, hi in leg_data
+        ])
+
+        for (m, leg, lo, hi), (p, prob_src) in zip(leg_data, prob_results):
             k_ask = float(m.get("yes_ask_dollars", 1.0))
             k_bid = float(m.get("yes_bid_dollars", 0.0))
             edge  = p - k_ask
@@ -378,6 +405,7 @@ async def scan_weather_opportunities(
                 n_c   = kelly_contracts(1.0 - p, k_no, portfolio_balance)
                 deploy = round(n_c * k_no, 4)
 
+            display_forecast = forecast if forecast is not None else 0.0
             pair = {
                 "event_ticker":  event_ticker,
                 "ticker":        m.get("ticker", ""),
@@ -389,7 +417,7 @@ async def scan_weather_opportunities(
                 "high_f":        hi,
                 "kalshi_ask":    round(k_ask, 4),
                 "kalshi_bid":    round(k_bid, 4),
-                "noaa_forecast": forecast,
+                "noaa_forecast": display_forecast,
                 "noaa_prob":     round(p, 4),
                 "edge":          round(edge, 4),
                 "net_profit":    round(profit, 4),
@@ -397,7 +425,7 @@ async def scan_weather_opportunities(
                 "days_to_close": round(days_left, 2),
                 "contracts":     n_c,
                 "deploy_usd":    deploy,
-                "tomorrow_on":   tmrw_on,
+                "prob_src":      prob_src,
             }
             all_pairs.append(pair)
 
@@ -413,7 +441,7 @@ async def scan_weather_opportunities(
                     high_f=hi,
                     kalshi_ask=round(k_ask, 4),
                     kalshi_bid=round(k_bid, 4),
-                    forecast=forecast,
+                    forecast=display_forecast,
                     prob=round(p, 4),
                     edge=round(edge, 4),
                     net_profit=round(profit, 4),
@@ -421,7 +449,6 @@ async def scan_weather_opportunities(
                     days_to_close=round(days_left, 2),
                     contracts=n_c,
                     deploy_usd=deploy,
-                    tomorrow_on=tmrw_on,
                 ))
 
     await asyncio.gather(*[
@@ -433,13 +460,14 @@ async def scan_weather_opportunities(
     all_pairs.sort(key=lambda x: abs(x["edge"]), reverse=True)
 
     unique_events = len({et for et, _, _ in weather_events})
+    ensemble_count = sum(1 for p in all_pairs if p.get("prob_src") == "ensemble")
     logger.info(
         f"Weather scan: {len(all_pairs)} legs · {len(opportunities)} edges "
-        f"(≥{min_edge:.0%}) · tomorrow.io={'ON' if tmrw_on else 'OFF'}"
+        f"(≥{min_edge:.0%}) · ensemble={ensemble_count}/{len(all_pairs)} legs"
     )
     return {
         "opportunities": opportunities,
         "all_pairs":     all_pairs,
         "event_count":   unique_events,
-        "tomorrow_on":   tmrw_on,
+        "ensemble_pct":  round(ensemble_count / max(len(all_pairs), 1) * 100),
     }

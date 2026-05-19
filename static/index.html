@@ -704,8 +704,9 @@
     }
     const srcBadge = document.getElementById('wx-src-badge');
     if (srcBadge) {
-      srcBadge.textContent  = w.tomorrow_on ? 'NOAA + Tomorrow.io' : 'NOAA only';
-      srcBadge.className    = w.tomorrow_on ? 'badge cyan' : 'badge dim';
+      const pct = w.ensemble_pct || 0;
+      srcBadge.textContent = pct > 0 ? `${pct}% ensemble` : 'NOAA+Gaussian';
+      srcBadge.className   = pct > 80 ? 'badge cyan' : pct > 0 ? 'badge orange' : 'badge dim';
     }
 
     const body = document.getElementById('wx-body');

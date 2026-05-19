@@ -576,7 +576,7 @@ async def run_weather_scan():
                 "event_count":   wx["event_count"],
                 "pair_count":    len(wx["all_pairs"]),
                 "opp_count":     len(opps),
-                "tomorrow_on":   wx.get("tomorrow_on", False),
+                "ensemble_pct":  wx.get("ensemble_pct", 0),
                 "opportunities": [
                     {
                         "event":      o.event_ticker,
@@ -599,7 +599,8 @@ async def run_weather_scan():
                 "all_pairs": wx["all_pairs"],
             }
 
-            src = "NOAA+Tomorrow.io" if wx.get("tomorrow_on") else "NOAA"
+            ens_pct = wx.get("ensemble_pct", 0)
+            src     = f"ensemble {ens_pct}%" if ens_pct > 0 else "NOAA+Gaussian"
             log(
                 f"wx [{src}]: {wx['event_count']} events · "
                 f"{len(wx['all_pairs'])} legs · {len(opps)} edges",
@@ -666,14 +667,15 @@ async def run_weather_scan():
 
 async def weather_scan_loop():
     """Dedicated fast weather scan loop — independent of main scan cadence."""
-    from weather.noaa_client import prefetch_all
+    from weather.noaa_client import prefetch_all as noaa_prefetch
+    from weather.openmeteo_client import prefetch_all as om_prefetch
     await asyncio.sleep(3)   # let the main loop start first
-    # Warm NOAA cache for all cities before first scan
+    # Warm both forecast caches in parallel before first scan
     try:
-        await prefetch_all()
-        log("NOAA forecasts pre-cached for all cities", "system")
+        await asyncio.gather(noaa_prefetch(), om_prefetch(), return_exceptions=True)
+        log("NOAA + Open-Meteo ensemble pre-cached for all cities", "system")
     except Exception as e:
-        log(f"NOAA prefetch warning: {e}", "warn")
+        log(f"forecast prefetch warning: {e}", "warn")
 
     while True:
         try:
