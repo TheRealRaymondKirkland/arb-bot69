@@ -14,3 +14,10 @@ __pycache__/
 # Logs and temporary files
 *.log
 *.tmp
+logs/
+
+# Databases (paper trading state — local only)
+*.db
+
+# Generated cache files
+data/*.json

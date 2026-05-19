@@ -1,3 +1,4 @@
+httpx
 py-clob-client
 web3
 requests

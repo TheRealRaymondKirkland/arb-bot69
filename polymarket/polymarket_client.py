@@ -1,113 +1,239 @@
-import websocket
+#!/usr/bin/env python3
+import asyncio
 import json
-import threading
-import time
 import logging
-from threading import Lock
+import os
+from typing import Dict, List, Optional
 
-# Set up logging for debugging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+import httpx
+from dotenv import load_dotenv
+
+load_dotenv()
 logger = logging.getLogger(__name__)
+
+GAMMA_API = "https://gamma-api.polymarket.com"
+CLOB_API = "https://clob.polymarket.com"
+
+
+def _get_clob_client():
+    """Lazy-load py_clob_client since it requires the poly-trading-bot venv."""
+    try:
+        from py_clob_client.client import ClobClient
+        pk = os.getenv("POLYMARKET_PRIVATE_KEY", "")
+        host = os.getenv("POLYMARKET_HOST", CLOB_API)
+        chain_id = int(os.getenv("POLYMARKET_CHAIN_ID", "137"))
+        return ClobClient(host, key=pk, chain_id=chain_id)
+    except ImportError:
+        logger.error("py_clob_client not available. Install from poly-trading-bot venv.")
+        return None
+
 
 class PolymarketClient:
     def __init__(self):
-        self.ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-        self.token_ids = [
-            "104581834088683874933735763737237194006527779800533746604473663562104487090909",  # 300-324 Yes
-            "93466472616546736282903537705194142846363083134234705550446425815008134085963",  # 300-324 No
-            "43922231291025458841678228188174245727138103045821098415263506359671185443258",  # 325-349 Yes
-            "53375664434999366377314207204893340538836417260918196297938671959351160828263"   # 325-349 No
-        ]
-        self.order_books = {}
-        self.order_books_lock = Lock()
-        self.is_running = False
-        self.last_update = 0
-        self.update_count = 0  # Track number of updates received
+        self.dry_run = os.getenv("DRY_RUN", "true").lower() != "false"
+        self._clob = None
 
-    def _on_message(self, ws, message):
-        try:
-            data_list = json.loads(message)
-            if not isinstance(data_list, list):
-                data_list = [data_list]
-            with self.order_books_lock:
-                for data in data_list:
-                    if data.get("event_type") == "book":
-                        asset_id = data["asset_id"]
-                        new_bids = [(float(bid["price"]), float(bid["size"])) for bid in data["bids"]]
-                        new_asks = [(float(ask["price"]), float(ask["size"])) for ask in data["asks"]]
-                        self.order_books[asset_id] = {"bids": new_bids, "asks": new_asks}
-                        self.last_update = time.time()
-                        self.update_count += 1
-                        logger.info(f"Update #{self.update_count} for asset {asset_id}: {len(new_bids)} bids, {len(new_asks)} asks")
-                    else:
-                        logger.debug(f"Ignored message type: {data.get('event_type')}")
-        except Exception as e:
-            logger.error(f"Error processing message: {e}")
+    def _clob_client(self):
+        if self._clob is None:
+            self._clob = _get_clob_client()
+        return self._clob
 
-    def _on_open(self, ws):
-        logger.info("WebSocket connection opened")
-        self.is_running = True
-        subscribe_message = {
-            "assets_ids": self.token_ids,
-            "type": "market"
-        }
-        ws.send(json.dumps(subscribe_message))
-        logger.debug("Sent subscription message")
+    async def get_neg_risk_opportunities(
+        self, client: httpx.AsyncClient, min_profit: float = 0.04
+    ) -> List[dict]:
+        """
+        Scan Polymarket neg-risk events where sum(YES ask) across all outcomes < 1.
+        All CLOB book fetches run concurrently (semaphore-limited) across all events.
+        Requires ALL books to be present — partial data is skipped to avoid false arbs.
+        """
+        # Paginate through all active neg-risk events (not just first 100)
+        events: list = []
+        offset = 0
+        while True:
+            try:
+                r = await client.get(
+                    f"{GAMMA_API}/events",
+                    params={"active": "true", "closed": "false", "limit": 200,
+                            "neg_risk": "true", "offset": offset},
+                    timeout=15,
+                )
+                r.raise_for_status()
+                page = r.json()
+            except Exception as e:
+                logger.error(f"Failed to fetch Polymarket events (offset={offset}): {e}")
+                break
+            if not isinstance(page, list) or not page:
+                break
+            events.extend(page)
+            offset += len(page)
+            if len(page) < 200:
+                break
 
-    def _on_error(self, ws, error):
-        logger.error(f"WebSocket error: {error}")
-        self.is_running = False
+        semaphore = asyncio.Semaphore(20)
 
-    def _on_close(self, ws, code, msg):
-        logger.warning(f"WebSocket closed: code={code}, msg={msg}")
-        self.is_running = False
-
-    def run(self):
-        def run_forever():
-            while True:
-                if not self.is_running:
-                    logger.info("Attempting to connect to WebSocket")
-                    ws = websocket.WebSocketApp(
-                        self.ws_url,
-                        on_open=self._on_open,
-                        on_message=self._on_message,
-                        on_error=self._on_error,
-                        on_close=self._on_close
+        async def fetch_book(token_id: str) -> Optional[dict]:
+            async with semaphore:
+                try:
+                    book_r = await client.get(
+                        f"{CLOB_API}/book",
+                        params={"token_id": token_id},
+                        timeout=10,
                     )
-                    try:
-                        ws.run_forever(ping_interval=30, ping_timeout=10)
-                    except Exception as e:
-                        logger.error(f"WebSocket run failed: {e}")
-                    time.sleep(5)  # Wait before reconnecting
-                else:
-                    time.sleep(1)  # Check again soon
+                    if book_r.status_code == 404:
+                        return None
+                    book_r.raise_for_status()
+                    asks = book_r.json().get("asks", [])
+                    if not asks:
+                        return None
+                    return {"price": float(asks[0]["price"]), "size": float(asks[0]["size"])}
+                except Exception:
+                    return None
 
-        wst = threading.Thread(target=run_forever)
-        wst.daemon = True
-        wst.start()
-        
-        timeout = 10
-        start_time = time.time()
-        while not self.is_running and time.time() - start_time < timeout:
-            time.sleep(0.1)
-        if not self.is_running:
-            logger.warning("WebSocket did not connect within timeout")
+        async def check_event(event: dict) -> Optional[dict]:
+            try:
+                markets = event.get("markets", [])
+                ob_markets = [
+                    m for m in markets
+                    if m.get("enableOrderBook") and m.get("active") and not m.get("closed")
+                ]
+                if len(ob_markets) < 2:
+                    return None
 
-    def get_order_books(self):
-        with self.order_books_lock:
-            if not self.order_books:
-                logger.warning("Order books empty when accessed")
-            else:
-                logger.debug(f"Returning order books with {len(self.order_books)} assets")
-            return self.order_books.copy()
+                # Collect token IDs; skip any market missing them
+                token_ids = []
+                valid_markets = []
+                for m in ob_markets:
+                    tids = json_loads_safe(m.get("clobTokenIds", "[]"))
+                    if tids:
+                        token_ids.append(tids[0])
+                        valid_markets.append(m)
 
-    def wait_for_initial_data(self, timeout=10):
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            with self.order_books_lock:
-                if all(token_id in self.order_books for token_id in self.token_ids):
-                    logger.info(f"Initial order book data received for all {len(self.token_ids)} tokens")
-                    return True
-            time.sleep(0.1)
-        logger.warning("Timed out waiting for initial order book data")
-        return False
+                if len(valid_markets) < 2:
+                    return None
+
+                # Fetch all order books concurrently
+                books = await asyncio.gather(*[fetch_book(tid) for tid in token_ids])
+
+                # Require ALL books — partial data means the sum is wrong
+                if any(b is None for b in books):
+                    return None
+
+                total_yes_ask = sum(b["price"] for b in books)
+                profit = 1.0 - total_yes_ask
+                if profit < min_profit:
+                    return None
+
+                market_details = [
+                    {
+                        "conditionId": m.get("conditionId"),
+                        "question": m.get("question", "")[:60],
+                        "yes_token": token_ids[i],
+                        "best_ask": books[i]["price"],
+                        "best_ask_size": books[i]["size"],
+                    }
+                    for i, m in enumerate(valid_markets)
+                ]
+
+                min_size = min(d["best_ask_size"] for d in market_details)
+                total_volume = sum(float(m.get("volumeNum", 0)) for m in ob_markets)
+
+                return {
+                    "event_slug": event.get("slug", ""),
+                    "title": event.get("title", ""),
+                    "n_markets": len(market_details),
+                    "sum_yes_ask": total_yes_ask,
+                    "profit": profit,
+                    "min_size": min_size,
+                    "total_volume": total_volume,
+                    "markets": market_details,
+                }
+            except Exception as e:
+                logger.debug(f"Skip Poly event {event.get('slug', '?')}: {e}")
+                return None
+
+        results = await asyncio.gather(*[check_event(e) for e in events])
+        opportunities = [r for r in results if r is not None]
+        opportunities.sort(key=lambda x: x["profit"], reverse=True)
+        return opportunities
+
+    async def execute_neg_risk_arb(
+        self,
+        opportunity: dict,
+        max_usdc: float = 50.0,
+    ) -> dict:
+        """Buy YES on every outcome in a neg-risk event."""
+        markets = opportunity["markets"]
+        sum_ask = opportunity["sum_yes_ask"]
+        min_size = opportunity["min_size"]
+
+        cost_per_set = sum_ask
+        max_sets_by_budget = max_usdc / cost_per_set if cost_per_set > 0 else 0
+        sets_to_buy = min(max_sets_by_budget, min_size)
+        sets_to_buy = round(sets_to_buy, 2)
+
+        if sets_to_buy <= 0:
+            return {"status": "skipped", "reason": "no available size"}
+
+        total_cost = sets_to_buy * sum_ask
+        expected_profit = sets_to_buy * opportunity["profit"]
+
+        logger.info(
+            f"{'[DRY RUN] ' if self.dry_run else ''}Poly neg-risk arb: {opportunity['title'][:40]} "
+            f"| {sets_to_buy:.2f} sets × ${sum_ask:.3f} = ${total_cost:.2f} cost "
+            f"| expected profit ${expected_profit:.2f}"
+        )
+
+        if self.dry_run:
+            return {
+                "status": "dry_run",
+                "event": opportunity["title"],
+                "sets": sets_to_buy,
+                "total_cost": total_cost,
+                "expected_profit": expected_profit,
+            }
+
+        clob = self._clob_client()
+        if not clob:
+            return {"status": "error", "reason": "clob client unavailable"}
+
+        orders_placed = []
+        try:
+            creds = clob.derive_api_key(nonce=0)
+            clob.set_api_creds(creds)
+
+            for m in markets:
+                from py_clob_client.clob_types import OrderArgs, OrderType
+                order_args = OrderArgs(
+                    token_id=m["yes_token"],
+                    price=m["best_ask"],
+                    size=sets_to_buy,
+                    side="BUY",
+                )
+                resp = clob.create_and_post_order(order_args)
+                orders_placed.append({
+                    "question": m["question"],
+                    "token": m["yes_token"],
+                    "status": "placed",
+                    "response": resp,
+                })
+        except Exception as e:
+            orders_placed.append({"status": "error", "reason": str(e)})
+            logger.error(f"Poly execution failed: {e}")
+
+        return {
+            "status": "executed",
+            "event": opportunity["title"],
+            "sets": sets_to_buy,
+            "total_cost": total_cost,
+            "expected_profit": expected_profit,
+            "orders": orders_placed,
+        }
+
+
+def json_loads_safe(s) -> list:
+    if isinstance(s, list):
+        return s
+    try:
+        return json.loads(s)
+    except Exception:
+        return []

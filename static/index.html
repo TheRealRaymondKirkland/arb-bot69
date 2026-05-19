@@ -1,0 +1,833 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ARB BOT // KALSHI × POLYMARKET</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap');
+
+    :root {
+      --green:   #00ff41;
+      --green2:  #00cc33;
+      --cyan:    #00ffff;
+      --orange:  #ff8c00;
+      --red:     #ff2222;
+      --yellow:  #ffff00;
+      --dim:     #1a6b2a;
+      --dimmer:  #0d3d17;
+      --bg:      #050a05;
+      --bg2:     #080f08;
+      --border:  #0d2e0d;
+      --glow:    0 0 8px #00ff41, 0 0 16px #00ff4133;
+      --glow-c:  0 0 8px #00ffff, 0 0 16px #00ffff33;
+      --glow-r:  0 0 8px #ff2222, 0 0 16px #ff222233;
+      --glow-o:  0 0 8px #ff8c00, 0 0 16px #ff8c0033;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: var(--bg);
+      color: var(--green);
+      font-family: 'Share Tech Mono', 'Courier New', monospace;
+      font-size: 12px;
+      height: 100vh;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* CRT scanline overlay */
+    body::before {
+      content: '';
+      position: fixed; inset: 0;
+      background: repeating-linear-gradient(
+        0deg,
+        transparent, transparent 2px,
+        rgba(0,0,0,0.04) 2px, rgba(0,0,0,0.04) 4px
+      );
+      pointer-events: none;
+      z-index: 1000;
+    }
+
+    /* Vignette */
+    body::after {
+      content: '';
+      position: fixed; inset: 0;
+      background: radial-gradient(ellipse at center,
+        transparent 60%, rgba(0,0,0,0.5) 100%);
+      pointer-events: none;
+      z-index: 999;
+    }
+
+    /* ── Header ── */
+    #header {
+      border-bottom: 1px solid var(--border);
+      padding: 6px 16px;
+      display: flex;
+      align-items: center;
+      gap: 0;
+      background: var(--bg2);
+      flex-shrink: 0;
+    }
+
+    #header .logo {
+      font-size: 15px;
+      font-weight: bold;
+      color: var(--green);
+      text-shadow: var(--glow);
+      letter-spacing: 2px;
+      margin-right: 32px;
+      white-space: nowrap;
+    }
+
+    .stat-block {
+      display: flex;
+      flex-direction: column;
+      margin-right: 28px;
+      min-width: 90px;
+    }
+    .stat-label { color: var(--dim); font-size: 10px; text-transform: uppercase; letter-spacing: 1px; }
+    .stat-value { color: var(--cyan); font-size: 13px; text-shadow: var(--glow-c); }
+    .stat-value.green { color: var(--green); text-shadow: var(--glow); }
+    .stat-value.red   { color: var(--red);   text-shadow: var(--glow-r); }
+    .stat-value.orange{ color: var(--orange); text-shadow: var(--glow-o); }
+
+    #mode-badge {
+      margin-left: auto;
+      padding: 4px 12px;
+      border: 1px solid;
+      font-size: 11px;
+      letter-spacing: 2px;
+    }
+    #mode-badge.dry  { border-color: var(--orange); color: var(--orange); text-shadow: var(--glow-o); }
+    #mode-badge.live { border-color: var(--green);  color: var(--green);  text-shadow: var(--glow); animation: pulse 1.5s infinite; }
+    #scanning-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--dim); margin-right: 8px; }
+    #scanning-dot.active { background: var(--green); box-shadow: var(--glow); animation: blink 0.6s infinite; }
+
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.6} }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.2} }
+    @keyframes flash { 0%{background:rgba(0,255,65,0.15)} 100%{background:transparent} }
+    @keyframes slideIn { from{transform:translateX(100%);opacity:0} to{transform:translateX(0);opacity:1} }
+
+    /* ── Main grid ── */
+    #main {
+      display: grid;
+      grid-template-columns: 1fr 2fr;
+      grid-template-rows: 1fr 180px 140px;
+      gap: 1px;
+      flex: 1;
+      overflow: hidden;
+      background: var(--border);
+    }
+
+    .panel {
+      background: var(--bg2);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .panel-header {
+      padding: 5px 12px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      background: #050d05;
+      flex-shrink: 0;
+    }
+
+    .panel-title {
+      font-size: 11px;
+      letter-spacing: 2px;
+      text-transform: uppercase;
+      color: var(--green);
+      text-shadow: var(--glow);
+    }
+
+    .badge {
+      font-size: 10px;
+      padding: 1px 6px;
+      border: 1px solid;
+      letter-spacing: 1px;
+    }
+    .badge.green  { border-color: var(--green);  color: var(--green); }
+    .badge.orange { border-color: var(--orange); color: var(--orange); }
+    .badge.cyan   { border-color: var(--cyan);   color: var(--cyan); }
+    .badge.dim    { border-color: var(--dim);     color: var(--dim); }
+
+    .panel-body {
+      flex: 1;
+      overflow-y: auto;
+      padding: 0;
+    }
+
+    /* Custom scrollbar */
+    .panel-body::-webkit-scrollbar { width: 4px; }
+    .panel-body::-webkit-scrollbar-track { background: var(--bg); }
+    .panel-body::-webkit-scrollbar-thumb { background: var(--dim); }
+
+    /* ── Tables ── */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 11px;
+    }
+
+    thead th {
+      padding: 4px 10px;
+      text-align: left;
+      color: var(--dim);
+      font-size: 10px;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+      border-bottom: 1px solid var(--border);
+      position: sticky;
+      top: 0;
+      background: #050d05;
+    }
+
+    tbody tr {
+      border-bottom: 1px solid #0a1a0a;
+      transition: background 0.15s;
+    }
+    tbody tr:hover { background: #0a1f0a; }
+    tbody tr.arb-row { background: rgba(0,255,65,0.05); animation: flash 0.8s ease; }
+    tbody tr.arb-row:hover { background: rgba(0,255,65,0.1); }
+
+    td { padding: 5px 10px; vertical-align: middle; }
+
+    .profit-pos { color: var(--green); text-shadow: var(--glow); font-weight: bold; }
+    .profit-neg { color: var(--red); }
+    .profit-near{ color: var(--orange); }
+    .text-cyan  { color: var(--cyan); }
+    .text-dim   { color: var(--dim); }
+    .text-green { color: var(--green); }
+    .text-orange{ color: var(--orange); text-shadow: var(--glow-o); }
+    .score-high { color: var(--green); text-shadow: var(--glow); }
+    .score-mid  { color: var(--cyan); }
+    .score-low  { color: var(--dim); }
+
+    .safe-yes { color: var(--green); text-shadow: var(--glow); }
+    .safe-no  { color: var(--orange); }
+
+    .dir-badge {
+      font-size: 10px;
+      padding: 1px 5px;
+      border: 1px solid var(--dim);
+      color: var(--dim);
+      white-space: nowrap;
+    }
+    .dir-badge.active {
+      border-color: var(--green);
+      color: var(--green);
+      text-shadow: var(--glow);
+    }
+
+    /* ── Log panel ── */
+    #log-panel { grid-column: 1 / -1; }
+
+    #log-body {
+      padding: 4px 12px;
+      font-size: 11px;
+      line-height: 1.8;
+      overflow-y: auto;
+      height: 100%;
+    }
+
+    .log-line { display: flex; gap: 12px; }
+    .log-ts   { color: var(--dim); white-space: nowrap; flex-shrink: 0; }
+    .log-msg  { }
+    .log-msg.info    { color: var(--green2); }
+    .log-msg.dim     { color: var(--dim); }
+    .log-msg.warn    { color: var(--orange); text-shadow: var(--glow-o); }
+    .log-msg.error   { color: var(--red);    text-shadow: var(--glow-r); }
+    .log-msg.success { color: var(--green);  text-shadow: var(--glow); }
+    .log-msg.system  { color: var(--cyan);   text-shadow: var(--glow-c); }
+    .log-msg.arb     { color: var(--green);  text-shadow: var(--glow); font-weight: bold; animation: pulse 1s infinite; }
+
+    /* ── ARB alert ribbon ── */
+    #arb-ribbon {
+      position: fixed;
+      top: 48px; right: 0;
+      width: 320px;
+      z-index: 500;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 4px;
+      pointer-events: none;
+    }
+
+    .arb-alert {
+      background: rgba(0,255,65,0.08);
+      border: 1px solid var(--green);
+      padding: 6px 10px;
+      font-size: 11px;
+      text-shadow: var(--glow);
+      animation: slideIn 0.3s ease;
+    }
+    .arb-alert .arb-pct { font-size: 16px; color: var(--green); text-shadow: var(--glow); }
+
+    /* ── Countdown bar ── */
+    #countdown-bar {
+      height: 2px;
+      background: var(--border);
+      flex-shrink: 0;
+      position: relative;
+      overflow: hidden;
+    }
+    #countdown-fill {
+      height: 100%;
+      background: var(--green);
+      box-shadow: 0 0 6px var(--green);
+      transition: width 1s linear;
+    }
+
+    /* ── Paper portfolio ── */
+    #paper-stats {
+      display: flex;
+      gap: 0;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+    .paper-stat {
+      flex: 1;
+      padding: 6px 12px;
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+    }
+    .paper-stat:last-child { border-right: none; }
+    .paper-stat .ps-label { font-size: 9px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim); }
+    .paper-stat .ps-val   { font-size: 15px; margin-top: 2px; font-weight: bold; }
+    .paper-stat .ps-sub   { font-size: 10px; color: var(--dim); margin-top: 1px; }
+    .paper-stat-wide      { flex: 1.4; }
+
+    @keyframes flash-num {
+      0%   { opacity: 0.3; transform: scale(1.04); }
+      100% { opacity: 1;   transform: scale(1); }
+    }
+    .val-flash { animation: flash-num 0.35s ease; }
+
+    /* ── Empty states ── */
+    .empty { color: var(--dimmer); padding: 16px 12px; font-size: 11px; }
+
+    /* ── Cursor blink ── */
+    .cursor::after {
+      content: '█';
+      animation: blink 1s infinite;
+      color: var(--green);
+    }
+  </style>
+</head>
+<body>
+
+<!-- Header -->
+<div id="header">
+  <div class="logo">▓▓ ARB_BOT // KALSHI × POLYMARKET ▓▓</div>
+
+  <div class="stat-block">
+    <span class="stat-label">Balance</span>
+    <span class="stat-value green" id="h-balance">—</span>
+  </div>
+  <div class="stat-block">
+    <span class="stat-label">Today P&amp;L</span>
+    <span class="stat-value" id="h-pnl">$0.00</span>
+  </div>
+  <div class="stat-block">
+    <span class="stat-label">Uptime</span>
+    <span class="stat-value" id="h-uptime">00:00:00</span>
+  </div>
+  <div class="stat-block">
+    <span class="stat-label">Scans</span>
+    <span class="stat-value" id="h-scans">0</span>
+  </div>
+  <div class="stat-block">
+    <span class="stat-label">Last Scan</span>
+    <span class="stat-value" id="h-last">—</span>
+  </div>
+  <div class="stat-block">
+    <span class="stat-label">Next Scan</span>
+    <span class="stat-value" id="h-next">—</span>
+  </div>
+
+  <span id="scanning-dot"></span>
+  <div id="mode-badge" class="dry">DRY RUN</div>
+</div>
+
+<!-- Countdown bar -->
+<div id="countdown-bar"><div id="countdown-fill" style="width:100%"></div></div>
+
+<!-- Main grid -->
+<div id="main">
+
+  <!-- Kalshi MECE -->
+  <div class="panel">
+    <div class="panel-header">
+      <span class="panel-title">Kalshi MECE Arb</span>
+      <span class="badge dim" id="mece-count">0 opps</span>
+    </div>
+    <div class="panel-body" id="mece-body">
+      <div class="empty">waiting for scan...</div>
+    </div>
+  </div>
+
+  <!-- Binary Cross-Platform -->
+  <div class="panel">
+    <div class="panel-header">
+      <span class="panel-title">Binary Cross-Platform</span>
+      <span class="badge dim" id="binary-count">—</span>
+      <span class="badge dim" id="arb-count" style="margin-left:auto">0 ARBs</span>
+    </div>
+    <div class="panel-body" id="binary-body">
+      <div class="empty">waiting for scan...</div>
+    </div>
+  </div>
+
+  <!-- Paper Portfolio spans full width -->
+  <div class="panel" style="grid-column: 1 / -1; max-height: 220px;">
+    <div class="panel-header">
+      <span class="panel-title">Paper Portfolio</span>
+      <span class="badge orange" id="paper-mode-badge">PAPER TRADING</span>
+      <span class="badge dim" id="paper-pos-count" style="margin-left:auto">0 positions</span>
+    </div>
+    <div id="paper-stats">
+      <div class="paper-stat paper-stat-wide">
+        <span class="ps-label">Total Assets</span>
+        <span class="ps-val text-cyan" id="ps-assets">—</span>
+        <span class="ps-sub" id="ps-assets-sub">of $1,000.00 starting</span>
+      </div>
+      <div class="paper-stat paper-stat-wide">
+        <span class="ps-label">Overall Return</span>
+        <span class="ps-val" id="ps-return">—</span>
+        <span class="ps-sub" id="ps-return-sub">realized + open EP</span>
+      </div>
+      <div class="paper-stat">
+        <span class="ps-label">Realized P&amp;L</span>
+        <span class="ps-val" id="ps-realized">—</span>
+        <span class="ps-sub" id="ps-settled-sub">0 settlements</span>
+      </div>
+      <div class="paper-stat">
+        <span class="ps-label">Open Expected P&amp;L</span>
+        <span class="ps-val" id="ps-ep">—</span>
+        <span class="ps-sub" id="ps-open-sub">0 positions</span>
+      </div>
+      <div class="paper-stat">
+        <span class="ps-label">Deployed</span>
+        <span class="ps-val text-orange" id="ps-deployed">—</span>
+        <span class="ps-sub" id="ps-util-sub">0% of capital</span>
+      </div>
+      <div class="paper-stat" style="min-width:80px;flex:0.6;align-items:flex-end;">
+        <span class="ps-label">Updated</span>
+        <span class="ps-sub" id="ps-updated" style="font-size:11px;color:var(--green)">—</span>
+      </div>
+    </div>
+    <div class="panel-body" id="paper-body">
+      <div class="empty">no paper positions yet — waiting for first safe arb...</div>
+    </div>
+  </div>
+
+  <!-- Scan Log spans full width -->
+  <div class="panel" id="log-panel">
+    <div class="panel-header">
+      <span class="panel-title">Scan Log</span>
+      <span class="badge cyan" id="log-count">0 entries</span>
+      <span class="text-dim" style="margin-left:auto;font-size:10px" id="log-status">
+        <span class="cursor"></span>
+      </span>
+    </div>
+    <div class="panel-body">
+      <div id="log-body"></div>
+    </div>
+  </div>
+
+</div>
+
+<!-- ARB alert ribbon -->
+<div id="arb-ribbon"></div>
+
+<script>
+  const WS_URL = `ws://${location.host}/ws`;
+  let ws = null;
+  let scanInterval = 60;
+  let nextScanIn   = 60;
+
+  function connect() {
+    ws = new WebSocket(WS_URL);
+    ws.onmessage = (e) => {
+      const { event, data } = JSON.parse(e.data);
+      if (event === 'state_update') applyState(data);
+      if (event === 'scan_start')   onScanStart();
+      if (event === 'tick')         onTick(data);
+    };
+    ws.onclose = () => setTimeout(connect, 2000);
+    // Keepalive ping every 25s
+    setInterval(() => { if (ws.readyState === 1) ws.send('ping'); }, 25000);
+  }
+
+  function onScanStart() {
+    document.getElementById('scanning-dot').classList.add('active');
+    document.getElementById('h-next').textContent = 'SCANNING';
+    document.getElementById('countdown-fill').style.width = '0%';
+  }
+
+  function onTick(data) {
+    nextScanIn = data.next_scan_in || nextScanIn;
+    document.getElementById('scanning-dot').classList.remove('active');
+    document.getElementById('h-uptime').textContent = data.uptime || '—';
+    document.getElementById('h-next').textContent   = `${nextScanIn}s`;
+    const pct = Math.round((nextScanIn / scanInterval) * 100);
+    document.getElementById('countdown-fill').style.width = pct + '%';
+    updatePnl(data.pnl, data.trades);
+    if (data.paper) renderPaper(data.paper);
+  }
+
+  function updatePnl(pnl, trades) {
+    const el = document.getElementById('h-pnl');
+    if (pnl == null) return;
+    el.textContent = `$${pnl >= 0 ? '+' : ''}${pnl.toFixed(4)}  (${trades} trades)`;
+    el.className   = 'stat-value ' + (pnl > 0 ? 'green' : pnl < 0 ? 'red' : '');
+  }
+
+  function applyState(d) {
+    scanInterval = 60; // default
+
+    // Header
+    const bal = d.balance != null ? `$${d.balance.toFixed(2)}` : '—';
+    document.getElementById('h-balance').textContent = bal;
+    document.getElementById('h-uptime').textContent  = d.uptime || '—';
+    document.getElementById('h-scans').textContent   = d.scan_count || 0;
+    document.getElementById('h-last').textContent    = d.last_scan_ts
+      ? `${d.last_scan_ts} (${d.last_scan_dur}s)` : '—';
+    document.getElementById('h-next').textContent    = d.scanning ? 'SCANNING' : `${d.next_scan_in || '—'}s`;
+    nextScanIn = d.next_scan_in || 60;
+    updatePnl(d.pnl, d.trades);
+
+    const dot = document.getElementById('scanning-dot');
+    d.scanning ? dot.classList.add('active') : dot.classList.remove('active');
+
+    const pct = Math.round(((d.next_scan_in || 0) / scanInterval) * 100);
+    document.getElementById('countdown-fill').style.width = (d.scanning ? 0 : pct) + '%';
+
+    const badge = document.getElementById('mode-badge');
+    badge.textContent = d.mode;
+    badge.className   = d.mode === 'LIVE' ? 'live' : 'dry';
+
+    // MECE panel
+    renderMece(d.kalshi_opps || []);
+
+    // Binary panel
+    if (d.binary) renderBinary(d.binary);
+
+    // Log
+    renderLog(d.log || []);
+
+    // ARB alerts
+    renderArbRibbon(d.arb_alerts || []);
+
+    // Paper portfolio
+    if (d.paper) renderPaper(d.paper);
+  }
+
+  /* ── MECE table ── */
+  function renderMece(opps) {
+    const badge = document.getElementById('mece-count');
+    badge.textContent = `${opps.length} opps`;
+    badge.className   = opps.length > 0 ? 'badge green' : 'badge dim';
+
+    const body = document.getElementById('mece-body');
+    if (!opps.length) {
+      body.innerHTML = '<div class="empty">no mece arb opportunities detected</div>';
+      return;
+    }
+
+    let html = `<table>
+      <thead><tr>
+        <th>Event</th>
+        <th>Gross</th>
+        <th>Fees</th>
+        <th>Net/set</th>
+        <th>Sets</th>
+        <th>Deploy</th>
+        <th>Exp. Profit</th>
+        <th>Closes</th>
+        <th>Safe?</th>
+      </tr></thead><tbody>`;
+
+    for (const o of opps) {
+      const safeIcon = o.safe
+        ? '<span class="safe-yes">✓ SAFE</span>'
+        : '<span class="safe-no">⚠ INCOMPLETE</span>';
+      const gross  = o.gross_profit != null ? (o.gross_profit*100).toFixed(1)+'%' : '—';
+      const fee    = o.fee_per_set  != null ? (o.fee_per_set*100).toFixed(2)+'%'  : '—';
+      const sets   = o.book_sets   ?? 0;
+      const deploy = o.deploy      ?? 0;
+      const ep     = o.exp_profit  ?? 0;
+      const days   = o.days_to_close;
+      const closesStr = days == null || days === '?'
+        ? '—'
+        : days < 1 ? `<span class="text-orange">${(days*24).toFixed(0)}h</span>`
+        : `${days.toFixed(1)}d`;
+      html += `<tr ${o.safe ? 'class="arb-row"' : ''}>
+        <td class="text-green">${esc(o.title.substring(0,48))}</td>
+        <td class="text-dim">${gross}</td>
+        <td class="text-orange">${fee}</td>
+        <td class="profit-pos">${(o.profit*100).toFixed(1)}%</td>
+        <td class="text-dim">${sets}</td>
+        <td class="text-cyan">$${deploy.toFixed(2)}</td>
+        <td class="profit-pos">+$${ep.toFixed(2)}</td>
+        <td>${closesStr}</td>
+        <td>${safeIcon}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    body.innerHTML = html;
+  }
+
+  /* ── Binary cross-platform table ── */
+  function renderBinary(b) {
+    const cntBadge = document.getElementById('binary-count');
+    cntBadge.textContent = `${b.kalshi_count} kalshi · ${b.poly_count} poly · ${b.pair_count} pairs`;
+
+    const arbBadge = document.getElementById('arb-count');
+    if (b.arbs && b.arbs.length > 0) {
+      arbBadge.textContent = `${b.arbs.length} ARB${b.arbs.length>1?'S':''} LIVE`;
+      arbBadge.className   = 'badge green';
+    } else {
+      arbBadge.textContent = '0 ARBs';
+      arbBadge.className   = 'badge dim';
+    }
+
+    const body = document.getElementById('binary-body');
+    if (!b.pairs || !b.pairs.length) {
+      body.innerHTML = '<div class="empty">no matched pairs yet</div>';
+      return;
+    }
+
+    let html = `<table>
+      <thead><tr>
+        <th>Score</th>
+        <th>Kalshi Market</th>
+        <th>Polymarket Question</th>
+        <th>K YES</th>
+        <th>P YES</th>
+        <th>Gap</th>
+        <th>Action</th>
+      </tr></thead><tbody>`;
+
+    // Show confirmed arbs first
+    for (const a of (b.arbs || [])) {
+      const dir  = a.direction === 'buy_kalshi_yes_poly_no' ? 'K✓ + P←' : 'P✓ + K←';
+      const pct  = (a.profit * 100).toFixed(2);
+      html += `<tr class="arb-row">
+        <td><span class="score-high">ARB</span></td>
+        <td class="text-green">${esc(a.k_title.substring(0,40))}</td>
+        <td class="text-green">${esc(a.p_title.substring(0,40))}</td>
+        <td class="text-cyan">$${a.k_yes.toFixed(3)}</td>
+        <td class="text-cyan">$${a.p_yes.toFixed(3)}</td>
+        <td class="profit-pos">+${pct}%</td>
+        <td><span class="dir-badge active">${dir}</span></td>
+      </tr>`;
+    }
+
+    for (const p of b.pairs) {
+      const sc    = p.score;
+      const scCls = sc >= 0.7 ? 'score-high' : sc >= 0.4 ? 'score-mid' : 'score-low';
+      const gap   = p.gap;
+      const gapStr = gap >= 0.03
+        ? `<span class="profit-pos">+${(gap*100).toFixed(1)}%</span>`
+        : gap >= 0
+        ? `<span class="profit-near">+${(gap*100).toFixed(1)}%</span>`
+        : `<span class="text-dim">${(gap*100).toFixed(1)}%</span>`;
+      const dirActive = gap >= 0.03;
+      html += `<tr>
+        <td><span class="${scCls}">${sc.toFixed(2)}</span></td>
+        <td class="text-dim">${esc(p.k_title.substring(0,40))}</td>
+        <td class="text-dim">${esc(p.p_title.substring(0,40))}</td>
+        <td class="text-dim">$${p.k_yes.toFixed(3)}</td>
+        <td class="text-dim">$${p.p_yes.toFixed(3)}</td>
+        <td>${gapStr}</td>
+        <td><span class="dir-badge ${dirActive?'active':''}">${p.dir.replace('_YES+','✓+').replace('_NO','←')}</span></td>
+      </tr>`;
+    }
+
+    html += '</tbody></table>';
+    body.innerHTML = html;
+  }
+
+  /* ── Scan log ── */
+  function renderLog(entries) {
+    const body  = document.getElementById('log-body');
+    const count = document.getElementById('log-count');
+    count.textContent = `${entries.length} entries`;
+
+    const html = entries.map(e =>
+      `<div class="log-line">
+         <span class="log-ts">${esc(e.ts)}</span>
+         <span class="log-msg ${e.level}">${esc(e.msg)}</span>
+       </div>`
+    ).join('');
+
+    const wasAtBottom = body.scrollHeight - body.clientHeight <= body.scrollTop + 2;
+    body.innerHTML = html;
+    if (wasAtBottom) body.scrollTop = body.scrollHeight;
+  }
+
+  /* ── Paper portfolio ── */
+  function setVal(id, text, cls) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (el.textContent !== text) {
+      el.classList.remove('val-flash');
+      void el.offsetWidth; // reflow to restart animation
+      el.classList.add('val-flash');
+    }
+    el.textContent = text;
+    if (cls !== undefined) el.className = `ps-val ${cls}`;
+  }
+
+  function ageSince(isoTs) {
+    if (!isoTs) return '—';
+    const ms = Date.now() - new Date(isoTs).getTime();
+    if (isNaN(ms) || ms < 0) return '—';
+    const s = Math.floor(ms / 1000);
+    if (s < 60)   return `${s}s ago`;
+    if (s < 3600) return `${Math.floor(s/60)}m ago`;
+    return `${Math.floor(s/3600)}h ago`;
+  }
+
+  function renderPaper(p) {
+    if (!p) return;
+
+    const vb           = p.virtual_balance  ?? 0;
+    const dep          = p.deployed         ?? 0;
+    const totalAssets  = vb + dep;
+    const returnPct    = (p.starting_balance ?? 0) > 0
+      ? ((p.total_ep_pnl ?? 0) / p.starting_balance * 100) : 0;
+    const utilPct      = (p.starting_balance ?? 0) > 0
+      ? (dep / p.starting_balance * 100) : 0;
+    const isUp         = p.total_ep_pnl >= 0;
+    const arrow        = isUp ? '▲' : '▼';
+    const sign         = v => v >= 0 ? '+' : '';
+
+    setVal('ps-assets',   `$${totalAssets.toFixed(2)}`, 'text-cyan');
+    document.getElementById('ps-assets-sub').textContent =
+      `of $${p.starting_balance.toFixed(2)} starting`;
+
+    setVal('ps-return',
+      `${arrow} ${sign(returnPct)}${returnPct.toFixed(2)}%`,
+      isUp ? 'profit-pos' : 'profit-neg');
+    document.getElementById('ps-return-sub').textContent =
+      `$${sign(p.total_ep_pnl)}${p.total_ep_pnl.toFixed(2)} total EP`;
+
+    const realCls = p.realized_pnl > 0 ? 'profit-pos' : p.realized_pnl < 0 ? 'profit-neg' : 'text-dim';
+    setVal('ps-realized',
+      `$${sign(p.realized_pnl)}${p.realized_pnl.toFixed(2)}`, realCls);
+    document.getElementById('ps-settled-sub').textContent =
+      `${p.settled_count} settlement${p.settled_count !== 1 ? 's' : ''}`;
+
+    setVal('ps-ep',
+      `$${sign(p.open_ep)}${p.open_ep.toFixed(2)}`,
+      p.open_ep > 0 ? 'profit-pos' : 'text-dim');
+    document.getElementById('ps-open-sub').textContent =
+      `${p.open_count} open position${p.open_count !== 1 ? 's' : ''}`;
+
+    setVal('ps-deployed', `$${p.deployed.toFixed(2)}`, 'text-orange');
+    document.getElementById('ps-util-sub').textContent =
+      `${utilPct.toFixed(1)}% of capital`;
+
+    const now = new Date();
+    document.getElementById('ps-updated').textContent =
+      now.toTimeString().substring(0,8);
+
+    const posCount = document.getElementById('paper-pos-count');
+    posCount.textContent = `${p.open_count} open · ${p.settled_count} settled`;
+    posCount.className   = p.open_count > 0 ? 'badge green' : 'badge dim';
+
+    const body = document.getElementById('paper-body');
+    const positions = p.positions || [];
+    if (!positions.length) {
+      body.innerHTML = '<div class="empty">no paper positions yet...</div>';
+      return;
+    }
+
+    // Open positions first, then settled
+    const sorted = [...positions].sort((a, b) => {
+      if (a.status === b.status) return 0;
+      return a.status === 'open' ? -1 : 1;
+    });
+
+    let html = `<table>
+      <thead><tr>
+        <th>Event</th>
+        <th>Platform</th>
+        <th>Sets</th>
+        <th>Cost</th>
+        <th>Edge</th>
+        <th>Margin</th>
+        <th>Status</th>
+        <th>P&amp;L</th>
+        <th>Age / Settled</th>
+      </tr></thead><tbody>`;
+
+    for (const pos of sorted) {
+      const isOpen = pos.status === 'open';
+      const actualPnl = pos.payout != null
+        ? pos.payout - pos.cost : null;
+      const pnlStr = actualPnl != null
+        ? `<span class="${actualPnl >= 0 ? 'profit-pos' : 'profit-neg'}">$${actualPnl >= 0 ? '+' : ''}${actualPnl.toFixed(4)}</span>`
+        : `<span class="profit-pos">~$+${pos.expected_profit.toFixed(4)}</span>`;
+      const marginPct = pos.profit_pct != null ? pos.profit_pct : 0;
+      const marginCls = marginPct > 20 ? 'text-orange' : 'profit-pos';
+      const timeCell = isOpen
+        ? `<span class="text-dim">${ageSince(pos.ts)}</span>`
+        : `<span class="text-dim">${pos.settled_ts ? pos.settled_ts.substring(11,19) : '—'}</span>`;
+      const statusEl = isOpen
+        ? '<span class="text-green">⬤ OPEN</span>'
+        : '<span class="profit-pos">✓ DONE</span>';
+
+      html += `<tr ${isOpen ? 'class="arb-row"' : ''}>
+        <td class="${isOpen ? 'text-green' : 'text-dim'}">${esc(pos.event)}</td>
+        <td class="text-dim">${esc(pos.platform)}</td>
+        <td class="text-dim">${pos.sets != null ? pos.sets.toFixed(2) : '—'}</td>
+        <td class="text-orange">$${(pos.cost ?? 0).toFixed(2)}</td>
+        <td class="${isOpen ? 'profit-pos' : 'text-dim'}">$${(pos.expected_profit ?? 0).toFixed(4)}</td>
+        <td class="${marginCls}">${marginPct.toFixed(1)}%</td>
+        <td>${statusEl}</td>
+        <td>${pnlStr}</td>
+        <td>${timeCell}</td>
+      </tr>`;
+    }
+    html += '</tbody></table>';
+    body.innerHTML = html;
+  }
+
+  /* ── ARB alert ribbon ── */
+  function renderArbRibbon(alerts) {
+    const ribbon = document.getElementById('arb-ribbon');
+    if (!alerts.length) { ribbon.innerHTML = ''; return; }
+    ribbon.innerHTML = alerts.slice(0, 3).map(a => `
+      <div class="arb-alert">
+        <div class="arb-pct">+${(a.profit*100).toFixed(2)}% ARB</div>
+        <div>${esc(a.k_title.substring(0,40))}</div>
+        <div class="text-dim">${esc(a.p_title.substring(0,40))}</div>
+        <div class="text-dim">${a.ts} · ${a.direction.replace('_',' ')}</div>
+      </div>
+    `).join('');
+  }
+
+  function esc(s) {
+    return String(s)
+      .replace(/&/g,'&amp;')
+      .replace(/</g,'&lt;')
+      .replace(/>/g,'&gt;');
+  }
+
+  connect();
+</script>
+</body>
+</html>
