@@ -1,16 +1,21 @@
 """
-Kalshi weather market scanner — NOAA + Tomorrow.io ensemble vs Kalshi prices.
+Kalshi weather market scanner — Open-Meteo ICON ensemble (39 members) vs Kalshi prices.
 
-Edge: NOAA NWS forecasts are ~90% accurate for next-day temps.
-      Tomorrow.io ML model (when API key set) provides an independent signal.
-      Ensemble = 40% NOAA + 60% Tomorrow.io (or 100% NOAA if Tomorrow.io unavailable).
+Edge: 39 independent model runs vote on each temperature bucket.
+      P(bucket) = votes / 39  (no Gaussian assumption needed).
 Kalshi weather markets are priced by retail traders who rarely check forecasts.
 When ensemble probability for a bucket differs from Kalshi's price by > MIN_EDGE,
 we have a tradeable opportunity.
 
-Position sizing: Quarter-Kelly criterion capped at 10% of portfolio per trade.
+Fees + friction model (realistic):
+  - Kalshi taker fee: 7% of price paid (not 7% of potential profit)
+  - Slippage: 0¢ for ≤5 contracts, 0.5¢ for 6-15, 1¢ for 16-25
+  - Max 20 contracts per trade (thin-book weather markets)
+  - Max $10 deployed per trade
+
+Position sizing: Quarter-Kelly criterion capped at 5% of portfolio.
   f* = (p*b - q) / b   (full Kelly fraction)
-  deploy = min(f*/4 * balance, 0.10 * balance)
+  deploy = min(f*/4 * balance, 0.05 * balance, MAX_DEPLOY)
 """
 import asyncio
 import logging
@@ -31,11 +36,11 @@ import weather.openmeteo_client as openmeteo
 
 logger = logging.getLogger(__name__)
 
-MIN_EDGE   = 0.12   # minimum |ensemble_prob - kalshi_price| to flag
-SIGMA      = 3.0    # NWS 24h forecast std-dev in °F
-MIN_PROFIT = 0.02   # min net profit after fees per contract
+MIN_EDGE   = 0.15   # minimum |ensemble_prob - kalshi_price| to flag
+SIGMA      = 3.0    # NWS 24h forecast std-dev in °F (fallback only)
+MIN_PROFIT = 0.05   # min total net profit after fees + slippage
 
-KALSHI_TAKER_FEE = 0.07
+KALSHI_TAKER_FEE = 0.07  # 7% of price paid per contract (Kalshi taker fee)
 
 # ── Known weather series (hardcoded fallback + seed for dynamic discovery) ────
 SERIES_MAP: dict[str, tuple[str, str]] = {
@@ -115,16 +120,25 @@ def _prob(forecast: float, low: Optional[float], high: Optional[float],
 
 # ── Kelly criterion ───────────────────────────────────────────────────────────
 
-MAX_CONTRACTS = 50    # Kalshi weather books are thin — realistic fill limit
-MAX_DEPLOY    = 20.0  # max dollars per position
+MAX_CONTRACTS = 20    # realistic thin-book weather market depth
+MAX_DEPLOY    = 10.0  # max dollars per position
+
+
+def _slippage(n: int) -> float:
+    """Market impact per contract in dollars (thin Kalshi weather books)."""
+    if n <= 5:
+        return 0.000
+    if n <= 15:
+        return 0.005
+    return 0.010
+
 
 def kelly_contracts(p: float, ask: float, balance: float,
                     max_pct: float = 0.05) -> int:
     """
     Quarter-Kelly position sizing capped for realistic Kalshi book depth.
-    Kalshi weather markets typically have 10-50 contracts available at any price.
     p:       our probability estimate
-    ask:     price per YES contract (0–1)
+    ask:     effective fill price per YES contract (0–1, includes slippage)
     balance: current virtual portfolio balance
     """
     if ask <= 0 or ask >= 1 or p <= ask:
@@ -396,22 +410,34 @@ async def scan_weather_opportunities(
             edge  = p - k_ask
 
             if edge > 0:
-                # Buy YES at k_ask: fee = 7% of potential profit per contract
-                fee    = KALSHI_TAKER_FEE * (1.0 - k_ask)
-                profit = p * (1.0 - k_ask) - (1.0 - p) * k_ask - fee
-                action = "buy_yes"
-                n_c    = kelly_contracts(p, k_ask, portfolio_balance)
-                deploy = round(n_c * k_ask, 4)
+                # Buy YES: size first pass with raw ask, then apply slippage
+                n_c      = kelly_contracts(p, k_ask, portfolio_balance)
+                slip     = _slippage(n_c)
+                eff_ask  = min(k_ask + slip, 0.99)
+                # Re-size with effective price so Kelly reflects actual cost
+                n_c      = kelly_contracts(p, eff_ask, portfolio_balance)
+                slip     = _slippage(n_c)
+                eff_ask  = min(k_ask + slip, 0.99)
+                profit_c = p - eff_ask * (1.0 + KALSHI_TAKER_FEE)  # p - price*1.07 (fee=7% of paid)
+                profit   = round(profit_c * n_c, 4)
+                deploy   = round(n_c * eff_ask, 4)
+                action   = "buy_yes"
             else:
-                # Buy NO at (1-k_bid): fee = 7% of potential profit per contract
-                k_no  = 1.0 - k_bid
-                fee   = KALSHI_TAKER_FEE * (1.0 - k_no)
-                profit = (1.0 - p) * (1.0 - k_no) - p * k_no - fee
-                action = "buy_no"
-                n_c   = kelly_contracts(1.0 - p, k_no, portfolio_balance)
-                deploy = round(n_c * k_no, 4)
+                # Buy NO at (1-k_bid)
+                k_no     = 1.0 - k_bid
+                n_c      = kelly_contracts(1.0 - p, k_no, portfolio_balance)
+                slip     = _slippage(n_c)
+                eff_no   = min(k_no + slip, 0.99)
+                n_c      = kelly_contracts(1.0 - p, eff_no, portfolio_balance)
+                slip     = _slippage(n_c)
+                eff_no   = min(k_no + slip, 0.99)
+                profit_c = (1.0 - p) - eff_no * (1.0 + KALSHI_TAKER_FEE)
+                profit   = round(profit_c * n_c, 4)
+                deploy   = round(n_c * eff_no, 4)
+                action   = "buy_no"
 
             display_forecast = forecast if forecast is not None else 0.0
+            eff_price = eff_ask if action == "buy_yes" else eff_no
             pair = {
                 "event_ticker":  event_ticker,
                 "ticker":        m.get("ticker", ""),
@@ -423,6 +449,7 @@ async def scan_weather_opportunities(
                 "high_f":        hi,
                 "kalshi_ask":    round(k_ask, 4),
                 "kalshi_bid":    round(k_bid, 4),
+                "eff_price":     round(eff_price, 4),
                 "noaa_forecast": display_forecast,
                 "noaa_prob":     round(p, 4),
                 "edge":          round(edge, 4),
