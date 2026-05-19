@@ -396,14 +396,16 @@ async def scan_weather_opportunities(
             edge  = p - k_ask
 
             if edge > 0:
-                fee    = KALSHI_TAKER_FEE * k_ask * (1.0 - k_ask)
+                # Buy YES at k_ask: fee = 7% of potential profit per contract
+                fee    = KALSHI_TAKER_FEE * (1.0 - k_ask)
                 profit = p * (1.0 - k_ask) - (1.0 - p) * k_ask - fee
                 action = "buy_yes"
                 n_c    = kelly_contracts(p, k_ask, portfolio_balance)
                 deploy = round(n_c * k_ask, 4)
             else:
+                # Buy NO at (1-k_bid): fee = 7% of potential profit per contract
                 k_no  = 1.0 - k_bid
-                fee   = KALSHI_TAKER_FEE * k_no * (1.0 - k_no)
+                fee   = KALSHI_TAKER_FEE * (1.0 - k_no)
                 profit = (1.0 - p) * (1.0 - k_no) - p * k_no - fee
                 action = "buy_no"
                 n_c   = kelly_contracts(1.0 - p, k_no, portfolio_balance)
