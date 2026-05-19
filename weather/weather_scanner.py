@@ -115,20 +115,24 @@ def _prob(forecast: float, low: Optional[float], high: Optional[float],
 
 # ── Kelly criterion ───────────────────────────────────────────────────────────
 
+MAX_CONTRACTS = 50    # Kalshi weather books are thin — realistic fill limit
+MAX_DEPLOY    = 20.0  # max dollars per position
+
 def kelly_contracts(p: float, ask: float, balance: float,
-                    max_pct: float = 0.10) -> int:
+                    max_pct: float = 0.05) -> int:
     """
-    Quarter-Kelly position sizing. Returns integer contract count ≥ 1.
+    Quarter-Kelly position sizing capped for realistic Kalshi book depth.
+    Kalshi weather markets typically have 10-50 contracts available at any price.
     p:       our probability estimate
     ask:     price per YES contract (0–1)
     balance: current virtual portfolio balance
     """
-    if ask <= 0 or ask >= 1 or p <= ask:   # no edge or degenerate
+    if ask <= 0 or ask >= 1 or p <= ask:
         return 1
-    b     = (1.0 - ask) / ask              # net profit per dollar risked
-    f_full  = (p * b - (1.0 - p)) / b     # full Kelly fraction
-    deploy  = min(f_full * 0.25 * balance, max_pct * balance)
-    return max(1, int(deploy / ask))
+    b       = (1.0 - ask) / ask
+    f_full  = (p * b - (1.0 - p)) / b
+    deploy  = min(f_full * 0.25 * balance, max_pct * balance, MAX_DEPLOY)
+    return max(1, min(MAX_CONTRACTS, int(deploy / ask)))
 
 
 # ── Ensemble forecast (display only) ─────────────────────────────────────────
