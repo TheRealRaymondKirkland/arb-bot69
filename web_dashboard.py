@@ -447,7 +447,24 @@ async def run_scan():
                     "ts": ts(), "profit": a["profit"], "k_title": a["team"],
                     "p_title": a["sport"], "direction": a["direction"]
                 })
-                notify_open(a["team"], f"SportsArb/{a['sport']}", 1, 1 - a["profit"], a["profit"])
+                if DRY_RUN and not state.get("circuit_open"):
+                    cost   = round(1 - a["profit"], 6)
+                    profit = round(a["profit"], 6)
+                    pt = record_paper_trade(
+                        platform="SportsArb",
+                        event=a["k_ticker"],
+                        sets=1,
+                        cost=cost,
+                        expected_profit=profit,
+                        orders=[{"ticker": a["k_ticker"], "direction": a["direction"],
+                                 "k_yes": a["k_yes"], "p_yes": a["p_yes"]}],
+                    )
+                    if pt["status"] == "opened":
+                        log(f"  [PAPER] sports arb opened: {a['k_ticker']}  cost=${cost:.4f}  ep=+${profit:.4f}", "success")
+                        notify_open(a["k_ticker"], f"SportsArb/{a['sport']}", 1, cost, profit)
+                        log_open("SportsArb", a["k_ticker"], 1, cost, profit)
+                    elif pt["status"] == "duplicate":
+                        log(f"  [PAPER] holding: {a['k_ticker']}", "dim")
         except Exception as e:
             log(f"sports scan error: {e}", "error")
 
