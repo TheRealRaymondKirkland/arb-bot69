@@ -567,7 +567,6 @@ async def run_weather_scan():
         try:
             wx   = await scan_weather_opportunities(
                 client,
-                min_edge=0.10,
                 max_days=3.0,
                 portfolio_balance=balance,
             )
@@ -618,7 +617,7 @@ async def run_weather_scan():
                 log(msg, "arb")
                 state["arb_alerts"].appendleft({
                     "ts":        ts(),
-                    "profit":    abs(o.net_profit * o.contracts),
+                    "profit":    abs(o.net_profit),
                     "k_title":   f"{o.city.title()} {o.metric} {o.leg_title}",
                     "p_title":   f"forecast={o.forecast}°F  Kelly={o.contracts}x",
                     "direction": direction,
@@ -626,7 +625,7 @@ async def run_weather_scan():
 
                 if DRY_RUN and not state.get("circuit_open"):
                     cost   = o.deploy_usd
-                    profit = round(o.net_profit * o.contracts, 6)
+                    profit = round(o.net_profit, 6)
                     pt = record_paper_trade(
                         platform="WeatherEdge",
                         event=o.ticker,
