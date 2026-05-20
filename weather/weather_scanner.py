@@ -336,7 +336,7 @@ async def scan_weather_opportunities(
         if not d:
             continue
         days_out = (datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc) - now_utc).days
-        if 0 <= days_out <= max_days:
+        if -1 <= days_out <= max_days:   # -1 allows today's events after UTC midnight
             combos.add((city, metric, d))
 
     point_cache: dict[tuple, Optional[float]] = {}
@@ -358,7 +358,7 @@ async def scan_weather_opportunities(
         if not d:
             return
         days_out = (datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc) - now_utc).days
-        if days_out < 0 or days_out > max_days:
+        if days_out < -1 or days_out > max_days:   # -1 allows today's events after UTC midnight
             return
 
         forecast = point_cache.get((city, metric, d))   # for display only
