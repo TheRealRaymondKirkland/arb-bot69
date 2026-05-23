@@ -1,21 +1,25 @@
 """
-Kalshi weather market scanner — Open-Meteo ICON ensemble (39 members) vs Kalshi prices.
+Kalshi weather scanner — NO-only ensemble strategy.
 
-Edge: 39 independent model runs vote on each temperature bucket.
-      P(bucket) = votes / 39  (no Gaussian assumption needed).
-Kalshi weather markets are priced by retail traders who rarely check forecasts.
-When ensemble probability for a bucket differs from Kalshi's price by > MIN_EDGE,
-we have a tradeable opportunity.
+Core insight from live trading analysis:
+  - buy_yes (specific bucket wins) had 13% win rate — structurally bad because
+    multiple YES bets per event and only one bucket can pay out.
+  - buy_no (specific bucket DOESN'T win) had 70% win rate but bad economics
+    because NO contracts priced at 88-90¢ only pay $1 back.
 
-Fees + friction model (realistic):
-  - Kalshi taker fee: 7% of price paid (not 7% of potential profit)
-  - Slippage: 0¢ for ≤5 contracts, 0.5¢ for 6-15, 1¢ for 16-25
-  - Max 20 contracts per trade (thin-book weather markets)
-  - Max $10 deployed per trade
+New strategy — only take NO bets when ALL of these are true:
+  1. Ensemble probability for the bucket < 5% (≤ 2/39 members land there)
+  2. Bucket center is ≥ 8°F from ensemble mean (model error can't bridge the gap)
+  3. YES is bid at ≥ 20¢ (so we pay ≤ 80¢ for NO, payout ratio is worthwhile)
+  4. Only ONE bet per city/metric/date (pick the highest-payout opportunity)
+  5. Market closes within 36 hours (short-term forecasts are most accurate)
 
-Position sizing: Quarter-Kelly criterion capped at 5% of portfolio.
-  f* = (p*b - q) / b   (full Kelly fraction)
-  deploy = min(f*/4 * balance, 0.05 * balance, MAX_DEPLOY)
+Economics with 90%+ win rate and NO_cost ≤ 0.80:
+  EV = 0.90 × (1 - 0.80) × 0.93 - 0.10 × 0.80
+     = 0.90 × 0.186 - 0.10 × 0.80
+     = 0.167 - 0.080 = +$0.087 per contract (positive EV)
+
+With 5 contracts per position: ~$0.43 expected profit on ~$4 deployed = ~10% per trade.
 """
 import asyncio
 import logging
@@ -36,59 +40,52 @@ import weather.openmeteo_client as openmeteo
 
 logger = logging.getLogger(__name__)
 
-MIN_EDGE   = 0.15   # minimum |ensemble_prob - kalshi_price| to flag
-SIGMA      = 3.0    # NWS 24h forecast std-dev in °F (fallback only)
-MIN_PROFIT = 0.05   # min total net profit after fees + slippage
+# ── Strategy parameters ───────────────────────────────────────────────────────
+ENSEMBLE_MAX_PROB  = 0.05   # bucket must be < 5% likely per ensemble (≤ 2/39 members)
+MIN_DISTANCE_F     = 8.0    # ensemble mean must be ≥ 8°F from bucket center
+MIN_YES_BID        = 0.20   # YES must be bid ≥ 20¢ (so NO costs ≤ 80¢)
+MAX_YES_ASK        = 0.50   # don't buy NO when YES > 50¢ (too risky)
+MAX_HOURS_TO_CLOSE = 36     # only trade markets closing within 36 hours
+MAX_CONTRACTS      = 5      # max 5 contracts per position (thin books)
+MAX_DEPLOY         = 4.0    # max $4 deployed per position
+MIN_PROFIT         = 0.10   # min total expected profit per position
+KALSHI_TAKER_FEE   = 0.07   # 7% of price paid
 
-KALSHI_TAKER_FEE = 0.07  # 7% of price paid per contract (Kalshi taker fee)
-
-# ── Known weather series (hardcoded fallback + seed for dynamic discovery) ────
+# ── Known weather series ──────────────────────────────────────────────────────
 SERIES_MAP: dict[str, tuple[str, str]] = {
-    # Seattle
     "KXHIGHTSEA":  ("seattle",      "high"),
     "KXLOWSEA":    ("seattle",      "low"),
-    # Houston
     "KXHIGHHOU":   ("houston",      "high"),
     "KXHIGHOU":    ("houston",      "high"),
     "KXLOWHOU":    ("houston",      "low"),
-    # New York
     "KXHIGHNYD":   ("new york",     "high"),
     "KXHIGHNYC":   ("new york",     "high"),
     "KXHIGHNY":    ("new york",     "high"),
     "KXLOWNYC":    ("new york",     "low"),
     "KXLOWNY":     ("new york",     "low"),
-    # Austin
     "KXLOWTAUS":   ("austin",       "low"),
     "KXHIGHAUST":  ("austin",       "high"),
+    "KXHIGHAUS":   ("austin",       "high"),
     "KXLOWAUS":    ("austin",       "low"),
-    # San Antonio
     "KXLOWTSATX":  ("san antonio",  "low"),
     "KXHIGHSAT":   ("san antonio",  "high"),
     "KXLOWSAT":    ("san antonio",  "low"),
-    # Chicago
     "KXLOWCHI":    ("chicago",      "low"),
     "KXHIGHCHI":   ("chicago",      "high"),
-    # Los Angeles
     "KXHIGHLAX":   ("los angeles",  "high"),
     "KXLOWLAX":    ("los angeles",  "low"),
-    # Dallas
     "KXHIGHDAL":   ("dallas",       "high"),
     "KXLOWDAL":    ("dallas",       "low"),
-    # Miami
     "KXHIGHMIA":   ("miami",        "high"),
     "KXLOWMIA":    ("miami",        "low"),
-    # Phoenix
     "KXHIGHPHX":   ("phoenix",      "high"),
     "KXLOWPHX":    ("phoenix",      "low"),
-    # Denver
     "KXHIGHDEN":   ("denver",       "high"),
     "KXLOWDEN":    ("denver",       "low"),
-    # Atlanta
     "KXHIGHATL":   ("atlanta",      "high"),
     "KXLOWATL":    ("atlanta",      "low"),
 }
 
-# Suffix → city mapping for dynamic discovery
 _SUFFIX_TO_CITY: dict[str, str] = {
     "SEA": "seattle",  "TSE": "seattle",
     "HOU": "houston",  "THOU": "houston", "IGHOU": "houston",
@@ -105,105 +102,37 @@ _SUFFIX_TO_CITY: dict[str, str] = {
 }
 
 
-# ── Probability math ──────────────────────────────────────────────────────────
-
-def _phi(x: float) -> float:
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-
-
-def _prob(forecast: float, low: Optional[float], high: Optional[float],
-          sigma: float = SIGMA) -> float:
-    lo = -1e9 if low  is None else low  - 0.5
-    hi =  1e9 if high is None else high + 0.5
-    return _phi((hi - forecast) / sigma) - _phi((lo - forecast) / sigma)
-
-
-# ── Kelly criterion ───────────────────────────────────────────────────────────
-
-MAX_CONTRACTS = 20    # realistic thin-book weather market depth
-MAX_DEPLOY    = 10.0  # max dollars per position
-
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _slippage(n: int) -> float:
-    """Market impact per contract in dollars (thin Kalshi weather books)."""
-    if n <= 5:
-        return 0.000
-    if n <= 15:
-        return 0.005
+    if n <= 5:  return 0.000
+    if n <= 15: return 0.005
     return 0.010
 
-
-def kelly_contracts(p: float, ask: float, balance: float,
-                    max_pct: float = 0.05) -> int:
-    """
-    Quarter-Kelly position sizing capped for realistic Kalshi book depth.
-    p:       our probability estimate
-    ask:     effective fill price per YES contract (0–1, includes slippage)
-    balance: current virtual portfolio balance
-    """
-    if ask <= 0 or ask >= 1 or p <= ask:
-        return 1
-    b       = (1.0 - ask) / ask
-    f_full  = (p * b - (1.0 - p)) / b
-    deploy  = min(f_full * 0.25 * balance, max_pct * balance, MAX_DEPLOY)
-    return max(1, min(MAX_CONTRACTS, int(deploy / ask)))
-
-
-# ── Ensemble forecast (display only) ─────────────────────────────────────────
-
-async def _point_forecast(city: str, metric: str, d: date) -> Optional[float]:
-    """
-    Get a single point forecast for display. Tries Open-Meteo mean, then NOAA.
-    NOT used for probability — that comes from get_ensemble_prob() below.
-    """
-    noaa_coro = noaa_daily_high(city, d) if metric == "high" else noaa_daily_low(city, d)
-    om_coro   = openmeteo.get_daily_high(city, d) if metric == "high" else openmeteo.get_daily_low(city, d)
-    noaa_f, om_f = await asyncio.gather(noaa_coro, om_coro)
-
-    if om_f is not None and noaa_f is not None:
-        return round(0.4 * noaa_f + 0.6 * om_f, 1)
-    return om_f or noaa_f
-
-
-async def get_ensemble_prob(
-    city: str, d: date, metric: str,
-    low_f: Optional[float], high_f: Optional[float],
-) -> tuple[float, str]:
-    """
-    Compute P(metric in [low_f, high_f]) using Open-Meteo ensemble (40 members).
-    Falls back to NOAA + Gaussian if ensemble unavailable.
-    Returns (probability, source_label).
-    """
-    om_prob = await openmeteo.get_bucket_prob(city, d, metric, low_f, high_f)
-    if om_prob is not None:
-        return om_prob, "ensemble"
-    # Fallback: NOAA point + Gaussian sigma=3°F
-    noaa_f = await (noaa_daily_high(city, d) if metric == "high" else noaa_daily_low(city, d))
-    if noaa_f is not None:
-        return _prob(noaa_f, low_f, high_f), "noaa+gaussian"
-    return 0.5, "unknown"
-
-
-# ── Range parser ──────────────────────────────────────────────────────────────
 
 def _parse_range(title: str) -> Tuple[Optional[float], Optional[float]]:
     t = title.strip()
     m = re.match(r"(\d+(?:\.\d+)?)[°\s]*to[°\s]*(\d+(?:\.\d+)?)", t, re.I)
-    if m:
-        return float(m.group(1)), float(m.group(2))
+    if m: return float(m.group(1)), float(m.group(2))
     m = re.match(r"(\d+(?:\.\d+)?)[°\s]*or above", t, re.I)
-    if m:
-        return float(m.group(1)), None
+    if m: return float(m.group(1)), None
     m = re.match(r"(\d+(?:\.\d+)?)[°\s]*or below", t, re.I)
-    if m:
-        return None, float(m.group(1))
+    if m: return None, float(m.group(1))
     m = re.match(r"above[°\s]*(\d+(?:\.\d+)?)", t, re.I)
-    if m:
-        return float(m.group(1)), None
+    if m: return float(m.group(1)), None
     m = re.match(r"below[°\s]*(\d+(?:\.\d+)?)", t, re.I)
-    if m:
-        return None, float(m.group(1))
+    if m: return None, float(m.group(1))
     return None, None
+
+
+def _bucket_center(lo: Optional[float], hi: Optional[float],
+                   ensemble_mean: float) -> float:
+    """Best estimate of bucket center for distance computation."""
+    if lo is not None and hi is not None:
+        return (lo + hi) / 2
+    if lo is None:   # "below X"
+        return hi - 5.0
+    return lo + 5.0  # "above X"
 
 
 def _parse_event_date(event_ticker: str) -> Optional[date]:
@@ -219,10 +148,6 @@ def _parse_event_date(event_ticker: str) -> Optional[date]:
 # ── Dynamic series discovery ──────────────────────────────────────────────────
 
 async def _discover_series(client: httpx.AsyncClient) -> dict[str, tuple[str, str]]:
-    """
-    Query Kalshi /series to find all KXHIGH*/KXLOW* series.
-    Merges with SERIES_MAP (hardcoded takes priority).
-    """
     from kalshi.kalshi_client import _get
     discovered: dict[str, tuple[str, str]] = {}
     try:
@@ -238,11 +163,8 @@ async def _discover_series(client: httpx.AsyncClient) -> dict[str, tuple[str, st
             city = _SUFFIX_TO_CITY.get(suffix)
             if city:
                 discovered[ticker] = (city, metric)
-        if discovered:
-            logger.info(f"Dynamic discovery: {len(discovered)} weather series found")
     except Exception as e:
         logger.debug(f"Series discovery failed: {e}")
-    # Hardcoded takes priority
     return {**discovered, **SERIES_MAP}
 
 
@@ -250,56 +172,53 @@ async def _discover_series(client: httpx.AsyncClient) -> dict[str, tuple[str, st
 
 @dataclass
 class WeatherOpportunity:
-    event_ticker:  str
-    ticker:        str
-    city:          str
-    metric:        str
-    target_date:   str
-    leg_title:     str
-    low_f:         Optional[float]
-    high_f:        Optional[float]
-    kalshi_ask:    float
-    kalshi_bid:    float
-    forecast:      float
-    prob:          float
-    edge:          float
-    net_profit:    float
-    action:        str
-    days_to_close: float
-    contracts:     int    = field(default=1)
-    deploy_usd:    float  = field(default=0.0)
-    tomorrow_on:   bool   = field(default=False)
-
-    # back-compat alias
-    @property
-    def noaa_forecast(self) -> float:
-        return self.forecast
+    event_ticker:    str
+    ticker:          str
+    city:            str
+    metric:          str
+    target_date:     str
+    leg_title:       str
+    low_f:           Optional[float]
+    high_f:          Optional[float]
+    kalshi_ask:      float
+    kalshi_bid:      float
+    forecast:        float          # ensemble mean for display
+    prob:            float          # ensemble bucket probability
+    edge:            float          # |kalshi_bid - prob| (how wrong the market is)
+    net_profit:      float          # total expected profit (all contracts)
+    action:          str            # always "buy_no"
+    days_to_close:   float
+    contracts:       int   = field(default=1)
+    deploy_usd:      float = field(default=0.0)
+    distance_f:      float = field(default=0.0)  # °F between bucket and ensemble mean
 
     @property
-    def noaa_prob(self) -> float:
-        return self.prob
+    def noaa_forecast(self) -> float: return self.forecast
+    @property
+    def noaa_prob(self)     -> float: return self.prob
 
 
 # ── Main scanner ──────────────────────────────────────────────────────────────
 
-_SEM = asyncio.Semaphore(8)   # max 8 concurrent Kalshi API calls
+_SEM = asyncio.Semaphore(8)
 
 
 async def scan_weather_opportunities(
     client: httpx.AsyncClient,
-    min_edge: float = MIN_EDGE,
-    max_days: float = 3.0,
+    max_days: float = 1.5,
     portfolio_balance: float = 1000.0,
 ) -> dict:
     """
-    Scan all active Kalshi weather markets vs NOAA + Tomorrow.io ensemble.
-    Returns dict with 'opportunities', 'all_pairs', 'event_count', 'tomorrow_on'.
+    Scan Kalshi weather markets for NO-bet opportunities where the ensemble
+    says a bucket is nearly impossible but the market still prices it ≥ 20¢.
+
+    Returns dict with 'opportunities', 'all_pairs', 'event_count', 'ensemble_pct'.
     """
     from kalshi.kalshi_client import _get
 
     series_map = await _discover_series(client)
 
-    # ── Step 1: fetch all active events in parallel ───────────────────────────
+    # ── Step 1: fetch all active events ──────────────────────────────────────
     weather_events: list[tuple[str, str, str]] = []
 
     async def fetch_events(prefix: str, city_metric: tuple):
@@ -314,59 +233,44 @@ async def scan_weather_opportunities(
             except Exception:
                 pass
 
-    await asyncio.gather(*[
-        fetch_events(pfx, cm) for pfx, cm in series_map.items()
-    ])
-
+    await asyncio.gather(*[fetch_events(pfx, cm) for pfx, cm in series_map.items()])
     logger.info(f"Weather scanner: {len(weather_events)} events from {len(series_map)} series")
 
     now_utc = datetime.now(timezone.utc)
 
-    # ── Step 2: pre-warm Open-Meteo ensemble cache for all relevant cities ────
+    # ── Step 2: warm ensemble cache for relevant cities ───────────────────────
     active_cities = {city for _, city, _ in weather_events}
     await asyncio.gather(
         *[openmeteo._fetch_ensemble(c) for c in active_cities],
         return_exceptions=True,
     )
 
-    # Point forecast cache for display only
-    combos: set[tuple[str, str, date]] = set()
-    for et, city, metric in weather_events:
-        d = _parse_event_date(et)
-        if not d:
-            continue
-        days_out = (datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc) - now_utc).days
-        if -1 <= days_out <= max_days:   # -1 allows today's events after UTC midnight
-            combos.add((city, metric, d))
-
-    point_cache: dict[tuple, Optional[float]] = {}
-
-    async def do_point(city: str, metric: str, d: date):
-        try:
-            point_cache[(city, metric, d)] = await _point_forecast(city, metric, d)
-        except Exception as e:
-            logger.warning(f"Point forecast failed {city}/{metric}/{d}: {e}")
-
-    await asyncio.gather(*[do_point(c, m, d) for c, m, d in combos])
-
-    # ── Step 3: fetch market legs + compute edges in parallel ─────────────────
+    # ── Step 3: process each event ────────────────────────────────────────────
     opportunities: list[WeatherOpportunity] = []
     all_pairs:     list[dict]               = []
+
+    # Track best NO opportunity per (city, metric, date) to avoid multi-betting
+    best_per_slot: dict[tuple, WeatherOpportunity] = {}
 
     async def process_event(event_ticker: str, city: str, metric: str):
         d = _parse_event_date(event_ticker)
         if not d:
             return
+
         days_out = (datetime.combine(d, datetime.min.time(), tzinfo=timezone.utc) - now_utc).days
-        if days_out < -1 or days_out > max_days:   # -1 allows today's events after UTC midnight
+        if days_out < -1 or days_out > max_days:
             return
 
-        forecast = point_cache.get((city, metric, d))   # for display only
+        # Get ensemble members once for this city/metric/date
+        members = await openmeteo.get_member_extremes(city, d, metric)
+        if not members or len(members) < 10:
+            return
+        ensemble_mean = sum(members) / len(members)
 
         async with _SEM:
             try:
                 data = await _get(client, "/markets", {
-                    "event_ticker": event_ticker, "limit": 20, "status": "open"
+                    "event_ticker": event_ticker, "limit": 25, "status": "open"
                 })
             except Exception:
                 return
@@ -378,66 +282,60 @@ async def scan_weather_opportunities(
 
         try:
             close_dt  = datetime.fromisoformat(markets[0]["close_time"].replace("Z", "+00:00"))
-            days_left = (close_dt - now_utc).total_seconds() / 86400
+            hours_left = (close_dt - now_utc).total_seconds() / 3600
         except Exception:
-            days_left = 1.0
+            hours_left = 12.0
 
-        logger.debug(
-            f"{event_ticker} | {city} {metric} {d} | "
-            f"point={forecast}°F | {len(markets)} legs | {days_left:.1f}d"
-        )
+        if hours_left <= 0 or hours_left > MAX_HOURS_TO_CLOSE:
+            return
 
-        # Compute ensemble probs for all legs in this event in parallel
-        leg_data = []
+        days_left = hours_left / 24
+
         for m in markets:
             leg    = m.get("yes_sub_title", "")
             lo, hi = _parse_range(leg)
             if lo is None and hi is None:
                 continue
-            leg_data.append((m, leg, lo, hi))
 
-        if not leg_data:
-            return
+            # Ensemble probability for this specific bucket
+            prob = openmeteo.bucket_prob(members, lo, hi)
 
-        prob_results = await asyncio.gather(*[
-            get_ensemble_prob(city, d, metric, lo, hi)
-            for _, _, lo, hi in leg_data
-        ])
+            # Filter 1: must be nearly impossible per ensemble
+            if prob > ENSEMBLE_MAX_PROB:
+                continue
 
-        for (m, leg, lo, hi), (p, prob_src) in zip(leg_data, prob_results):
+            # Filter 2: bucket must be far from ensemble mean
+            center   = _bucket_center(lo, hi, ensemble_mean)
+            distance = abs(ensemble_mean - center)
+            if distance < MIN_DISTANCE_F:
+                continue
+
             k_ask = float(m.get("yes_ask_dollars", 1.0))
             k_bid = float(m.get("yes_bid_dollars", 0.0))
-            edge  = p - k_ask
 
-            if edge > 0:
-                # Buy YES: size first pass with raw ask, then apply slippage
-                n_c      = kelly_contracts(p, k_ask, portfolio_balance)
-                slip     = _slippage(n_c)
-                eff_ask  = min(k_ask + slip, 0.99)
-                # Re-size with effective price so Kelly reflects actual cost
-                n_c      = kelly_contracts(p, eff_ask, portfolio_balance)
-                slip     = _slippage(n_c)
-                eff_ask  = min(k_ask + slip, 0.99)
-                profit_c = p - eff_ask * (1.0 + KALSHI_TAKER_FEE)  # p - price*1.07 (fee=7% of paid)
-                profit   = round(profit_c * n_c, 4)
-                deploy   = round(n_c * eff_ask, 4)
-                action   = "buy_yes"
-            else:
-                # Buy NO at (1-k_bid)
-                k_no     = 1.0 - k_bid
-                n_c      = kelly_contracts(1.0 - p, k_no, portfolio_balance)
-                slip     = _slippage(n_c)
-                eff_no   = min(k_no + slip, 0.99)
-                n_c      = kelly_contracts(1.0 - p, eff_no, portfolio_balance)
-                slip     = _slippage(n_c)
-                eff_no   = min(k_no + slip, 0.99)
-                profit_c = (1.0 - p) - eff_no * (1.0 + KALSHI_TAKER_FEE)
-                profit   = round(profit_c * n_c, 4)
-                deploy   = round(n_c * eff_no, 4)
-                action   = "buy_no"
+            # Filter 3: YES must be priced in the right range for profitable NO
+            if k_bid < MIN_YES_BID or k_ask > MAX_YES_ASK:
+                continue
 
-            display_forecast = forecast if forecast is not None else 0.0
-            eff_price = eff_ask if action == "buy_yes" else eff_no
+            # NO bet economics
+            k_no     = 1.0 - k_bid
+            slip     = _slippage(MAX_CONTRACTS)
+            eff_no   = min(k_no + slip, 0.99)
+            profit_c = (1.0 - prob) - eff_no * (1.0 + KALSHI_TAKER_FEE)
+
+            if profit_c <= 0:
+                continue
+
+            n_c      = max(1, min(MAX_CONTRACTS, int(MAX_DEPLOY / eff_no)))
+            profit   = round(profit_c * n_c, 4)
+            deploy   = round(n_c * eff_no, 4)
+
+            if profit < MIN_PROFIT:
+                continue
+
+            # Edge = how wrong the market is (YES_bid vs actual prob)
+            edge = k_bid - prob  # positive means market overprices the bucket
+
             pair = {
                 "event_ticker":  event_ticker,
                 "ticker":        m.get("ticker", ""),
@@ -449,58 +347,64 @@ async def scan_weather_opportunities(
                 "high_f":        hi,
                 "kalshi_ask":    round(k_ask, 4),
                 "kalshi_bid":    round(k_bid, 4),
-                "eff_price":     round(eff_price, 4),
-                "noaa_forecast": display_forecast,
-                "noaa_prob":     round(p, 4),
+                "eff_price":     round(eff_no, 4),
+                "noaa_forecast": round(ensemble_mean, 1),
+                "noaa_prob":     round(prob, 4),
                 "edge":          round(edge, 4),
                 "net_profit":    round(profit, 4),
-                "action":        action,
+                "action":        "buy_no",
                 "days_to_close": round(days_left, 2),
                 "contracts":     n_c,
                 "deploy_usd":    deploy,
-                "prob_src":      prob_src,
+                "distance_f":    round(distance, 1),
+                "prob_src":      "ensemble",
             }
             all_pairs.append(pair)
 
-            if abs(edge) >= min_edge and profit >= MIN_PROFIT:
-                opportunities.append(WeatherOpportunity(
-                    event_ticker=event_ticker,
-                    ticker=m.get("ticker", ""),
-                    city=city,
-                    metric=metric,
-                    target_date=str(d),
-                    leg_title=leg,
-                    low_f=lo,
-                    high_f=hi,
-                    kalshi_ask=round(k_ask, 4),
-                    kalshi_bid=round(k_bid, 4),
-                    forecast=display_forecast,
-                    prob=round(p, 4),
-                    edge=round(edge, 4),
-                    net_profit=round(profit, 4),
-                    action=action,
-                    days_to_close=round(days_left, 2),
-                    contracts=n_c,
-                    deploy_usd=deploy,
-                ))
+            # Keep only the best NO opportunity per (city, metric, date) slot
+            slot = (city, metric, str(d))
+            opp  = WeatherOpportunity(
+                event_ticker=event_ticker,
+                ticker=m.get("ticker", ""),
+                city=city,
+                metric=metric,
+                target_date=str(d),
+                leg_title=leg,
+                low_f=lo,
+                high_f=hi,
+                kalshi_ask=round(k_ask, 4),
+                kalshi_bid=round(k_bid, 4),
+                forecast=round(ensemble_mean, 1),
+                prob=round(prob, 4),
+                edge=round(edge, 4),
+                net_profit=round(profit, 4),
+                action="buy_no",
+                days_to_close=round(days_left, 2),
+                contracts=n_c,
+                deploy_usd=deploy,
+                distance_f=round(distance, 1),
+            )
+            existing = best_per_slot.get(slot)
+            if existing is None or k_bid > existing.kalshi_bid:
+                best_per_slot[slot] = opp
 
     await asyncio.gather(*[
         process_event(et, city, metric)
         for et, city, metric in weather_events
     ])
 
-    opportunities.sort(key=lambda x: abs(x.edge), reverse=True)
-    all_pairs.sort(key=lambda x: abs(x["edge"]), reverse=True)
+    # Build final opportunity list from best-per-slot
+    opportunities = sorted(best_per_slot.values(), key=lambda x: x.kalshi_bid, reverse=True)
+    all_pairs.sort(key=lambda x: x["edge"], reverse=True)
 
     unique_events = len({et for et, _, _ in weather_events})
-    ensemble_count = sum(1 for p in all_pairs if p.get("prob_src") == "ensemble")
     logger.info(
-        f"Weather scan: {len(all_pairs)} legs · {len(opportunities)} edges "
-        f"(≥{min_edge:.0%}) · ensemble={ensemble_count}/{len(all_pairs)} legs"
+        f"Weather scan (NO-only): {len(all_pairs)} candidates → "
+        f"{len(opportunities)} best-per-slot opportunities"
     )
     return {
         "opportunities": opportunities,
         "all_pairs":     all_pairs,
         "event_count":   unique_events,
-        "ensemble_pct":  round(ensemble_count / max(len(all_pairs), 1) * 100),
+        "ensemble_pct":  100,   # always ensemble now
     }

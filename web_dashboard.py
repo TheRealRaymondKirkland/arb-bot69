@@ -36,6 +36,7 @@ from utils.trade_log import daily_pnl
 from utils.paper_trader import get_paper_summary, record_paper_trade, get_open_positions, settle_position
 from utils.notifier import notify_open, notify_close, notify_pnl
 from utils.daily_logger import log_open, log_close, generate_summary
+from utils.risk_manager import can_open, circuit_open as risk_circuit_open
 
 logging.basicConfig(level=logging.INFO)
 
@@ -584,7 +585,7 @@ async def run_weather_scan():
         try:
             wx   = await scan_weather_opportunities(
                 client,
-                max_days=3.0,
+                max_days=1.5,
                 portfolio_balance=balance,
             )
             opps = wx["opportunities"]
@@ -595,20 +596,22 @@ async def run_weather_scan():
                 "ensemble_pct":  wx.get("ensemble_pct", 0),
                 "opportunities": [
                     {
-                        "event":      o.event_ticker,
-                        "city":       o.city.title(),
-                        "metric":     o.metric,
-                        "date":       o.target_date,
-                        "leg":        o.leg_title,
-                        "kalshi_ask": o.kalshi_ask,
-                        "noaa_prob":  o.prob,
-                        "noaa_temp":  o.forecast,
-                        "edge":       o.edge,
-                        "net_profit": o.net_profit,
-                        "action":     o.action,
-                        "days_left":  o.days_to_close,
-                        "contracts":  o.contracts,
-                        "deploy_usd": o.deploy_usd,
+                        "event":        o.event_ticker,
+                        "city":         o.city.title(),
+                        "metric":       o.metric,
+                        "date":         o.target_date,
+                        "leg":          o.leg_title,
+                        "kalshi_ask":   o.kalshi_ask,
+                        "kalshi_bid":   o.kalshi_bid,
+                        "noaa_prob":    o.prob,
+                        "noaa_temp":    o.forecast,
+                        "edge":         o.edge,
+                        "net_profit":   o.net_profit,
+                        "action":       o.action,
+                        "days_left":    o.days_to_close,
+                        "contracts":    o.contracts,
+                        "deploy_usd":   o.deploy_usd,
+                        "distance_f":   o.distance_f,
                     }
                     for o in opps
                 ],
@@ -616,33 +619,40 @@ async def run_weather_scan():
             }
 
             ens_pct = wx.get("ensemble_pct", 0)
-            src     = f"ensemble {ens_pct}%" if ens_pct > 0 else "NOAA+Gaussian"
             log(
-                f"wx [{src}]: {wx['event_count']} events · "
-                f"{len(wx['all_pairs'])} legs · {len(opps)} edges",
+                f"wx [NO-only, ensemble {ens_pct}%]: {wx['event_count']} events · "
+                f"{len(wx['all_pairs'])} candidates · {len(opps)} best-per-slot",
                 "info" if opps else "dim",
             )
 
+            paper_now = get_paper_summary()
+            wx_circuit = risk_circuit_open(paper_now)
+            if wx_circuit:
+                log("wx CIRCUIT OPEN — win rate too low, pausing new weather trades", "warn")
+
             for o in opps:
-                direction = "BUY YES" if o.action == "buy_yes" else "BUY NO"
                 msg = (
-                    f"*** WEATHER EDGE: {o.edge*100:+.1f}% — "
-                    f"{o.city.title()} {o.metric} {o.leg_title}  "
-                    f"forecast={o.forecast}°F  {o.contracts}x [{direction}]  "
-                    f"deploy=${o.deploy_usd:.2f}"
+                    f"*** WEATHER NO-BET: ensemble={o.forecast}°F  "
+                    f"bucket={o.leg_title}  dist={o.distance_f}°F  "
+                    f"YES_bid={o.kalshi_bid:.0%}  {o.contracts}c  "
+                    f"deploy=${o.deploy_usd:.2f}  ep=+${o.net_profit:.3f}"
                 )
                 log(msg, "arb")
                 state["arb_alerts"].appendleft({
                     "ts":        ts(),
                     "profit":    abs(o.net_profit),
-                    "k_title":   f"{o.city.title()} {o.metric} {o.leg_title}",
-                    "p_title":   f"forecast={o.forecast}°F  Kelly={o.contracts}x",
-                    "direction": direction,
+                    "k_title":   f"{o.city.title()} {o.metric} — NOT {o.leg_title}",
+                    "p_title":   f"ensemble={o.forecast}°F  dist={o.distance_f}°F away",
+                    "direction": "BUY NO",
                 })
 
-                if DRY_RUN and not state.get("circuit_open"):
+                if DRY_RUN and not state.get("circuit_open") and not wx_circuit:
                     cost   = o.deploy_usd
                     profit = round(o.net_profit, 6)
+                    allowed, reason = can_open("WeatherEdge", o.ticker, cost, paper_now)
+                    if not allowed:
+                        log(f"  [RISK] blocked {o.ticker}: {reason}", "dim")
+                        continue
                     pt = record_paper_trade(
                         platform="WeatherEdge",
                         event=o.ticker,
@@ -659,12 +669,14 @@ async def run_weather_scan():
                     )
                     if pt["status"] == "opened":
                         log(
-                            f"  [PAPER] wx trade: {o.ticker}  {direction}  "
-                            f"{o.contracts}x  cost=${cost:.2f}  ep=+${profit:.4f}",
+                            f"  [PAPER] wx NO-bet: {o.ticker}  "
+                            f"{o.contracts}x  cost=${cost:.2f}  ep=+${profit:.4f}  "
+                            f"dist={o.distance_f}°F from {o.forecast}°F",
                             "success",
                         )
                         notify_open(o.ticker, "WeatherEdge", o.contracts, cost, profit)
                         log_open("WeatherEdge", o.ticker, o.contracts, cost, profit)
+                        paper_now = get_paper_summary()  # refresh after each trade
 
         except Exception as e:
             log(f"weather scan error: {e}", "error")
