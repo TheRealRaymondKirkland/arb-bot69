@@ -11,9 +11,9 @@ import json
 from datetime import datetime
 from typing import Optional
 
-MAX_OPEN_POSITIONS  = 10
-MAX_DEPLOYED_PCT    = 0.10   # 10% of starting balance
-MAX_PER_SETTLE_DATE = 3
+MAX_OPEN_POSITIONS  = 15
+MAX_DEPLOYED_PCT    = 0.15   # 15% of starting balance
+MAX_PER_SETTLE_DATE = 5
 CIRCUIT_LOOKBACK    = 20     # trades to look back for win-rate check
 CIRCUIT_MIN_WINRATE = 0.40   # halt if win rate drops below 40%
 

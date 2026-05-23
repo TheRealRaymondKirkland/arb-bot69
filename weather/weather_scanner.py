@@ -41,14 +41,15 @@ import weather.openmeteo_client as openmeteo
 logger = logging.getLogger(__name__)
 
 # ── Strategy parameters ───────────────────────────────────────────────────────
-ENSEMBLE_MAX_PROB  = 0.05   # bucket must be < 5% likely per ensemble (≤ 2/39 members)
-MIN_DISTANCE_F     = 8.0    # ensemble mean must be ≥ 8°F from bucket center
-MIN_YES_BID        = 0.20   # YES must be bid ≥ 20¢ (so NO costs ≤ 80¢)
-MAX_YES_ASK        = 0.50   # don't buy NO when YES > 50¢ (too risky)
+# Target win rate ~82% → profitable when YES_bid ≥ 25¢ (verified by EV table)
+ENSEMBLE_MAX_PROB  = 0.20   # bucket must be < 20% likely per ensemble (≤ 8/39 members)
+MIN_DISTANCE_F     = 5.0    # ensemble mean must be ≥ 5°F from bucket center
+MIN_YES_BID        = 0.25   # YES must be bid ≥ 25¢ — minimum for EV+ at 80% win rate
+MAX_YES_ASK        = 0.55   # don't buy NO when YES ask > 55¢
 MAX_HOURS_TO_CLOSE = 36     # only trade markets closing within 36 hours
-MAX_CONTRACTS      = 5      # max 5 contracts per position (thin books)
-MAX_DEPLOY         = 4.0    # max $4 deployed per position
-MIN_PROFIT         = 0.10   # min total expected profit per position
+MAX_CONTRACTS      = 8      # max 8 contracts per position
+MAX_DEPLOY         = 6.0    # max $6 deployed per position
+MIN_PROFIT         = 0.05   # min total expected profit per position
 KALSHI_TAKER_FEE   = 0.07   # 7% of price paid
 
 # ── Known weather series ──────────────────────────────────────────────────────
